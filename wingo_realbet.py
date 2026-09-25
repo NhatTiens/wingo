@@ -310,7 +310,8 @@ class RealBetExecutor:
         return vals
 
     def place_top7(self, issue: str, numbers: list[int], stake_per_number: float, expected_total: float,
-                   before_submit: Callable[[], None] | None = None) -> dict[str, Any]:
+                   before_submit: Callable[[], None] | None = None,
+                   previous_win: tuple[float, float] | None = None) -> dict[str, Any]:
         if (len(numbers) != 7 or any(type(x) is not int or x not in range(10) for x in numbers)
                 or len(set(numbers)) != 7):
             raise RealBetError(f"TOP7 không hợp lệ: {numbers}")
@@ -425,40 +426,86 @@ class RealBetExecutor:
             # uncertain submission so a later START cannot silently retry it.
             raise RealBetError("Không rõ click submit đã gửi lệnh hay chưa", may_have_submitted=True) from exc
         result["submitted"] = True
-        page.wait_for_timeout(int(timing.get("after_submit_ms", 500)))
+        try:
+            page.wait_for_timeout(int(timing.get("after_submit_ms", 500)))
+        except Exception as exc:
+            raise RealBetError("Mất trang sau submit; cần đối soát lệnh", may_have_submitted=True) from exc
 
         confirm_cfg = cfg.get("confirm") or {}
         confirm_sel = str(confirm_cfg.get("selector") or "").strip()
         if confirm_sel:
-            confirm = page.locator(confirm_sel)
-            if confirm.count() == 1 and confirm.first.is_visible():
-                confirm.first.click()
-                page.wait_for_timeout(int(timing.get("after_confirm_ms", 700)))
-            elif bool(confirm_cfg.get("required", False)):
-                raise RealBetError("Đã click submit nhưng không tìm thấy confirm", may_have_submitted=True)
+            try:
+                confirm = page.locator(confirm_sel)
+                if confirm.count() == 1 and confirm.first.is_visible():
+                    confirm.first.click()
+                    page.wait_for_timeout(int(timing.get("after_confirm_ms", 700)))
+                elif bool(confirm_cfg.get("required", False)):
+                    raise RealBetError("Đã click submit nhưng không tìm thấy confirm", may_have_submitted=True)
+            except RealBetError:
+                raise
+            except Exception as exc:
+                raise RealBetError("Không rõ confirm đã gửi lệnh chưa", may_have_submitted=True) from exc
 
         success_cfg = cfg.get("success") or {}
         mode = str(success_cfg.get("mode") or "balance_decrease")
-        timeout_ms = int(success_cfg.get("timeout_ms", 5000))
+        timeout_ms = int(success_cfg.get("timeout_ms", 12000))
         confirmed = False
         ticket_text = None
         balance_after = None
 
         if mode == "balance_decrease":
             deadline = time.monotonic() + timeout_ms / 1000.0
+            refresh_after_ms = int(success_cfg.get("refresh_after_ms", 5000))
+            refresh_at = time.monotonic() + refresh_after_ms / 1000.0
             tol = float(success_cfg.get("balance_tolerance", 2.0))
+            # Only consider a payout from the immediately preceding, confirmed
+            # WIN if the balance at submit still equals that bet's post-debit
+            # balance. Its gross payout can mask this order's exact debit.
+            pending_payout = None
+            if previous_win is not None:
+                prior_payout, prior_after_submit = previous_win
+                if (prior_payout > 0 and
+                        abs(balance_before - prior_after_submit) <= tol):
+                    pending_payout = prior_payout
+            refreshed = False
+            missing_balance = 0
+            refresh_error = None
             while time.monotonic() < deadline:
+                # Reading through read_balance() could navigate away from the
+                # post-submit page when the site changes its URL. Keep that
+                # page intact while waiting for the debit to appear.
                 try:
-                    b = float(self.read_balance())
+                    b = self._balance_visible_value()
+                except Exception:
+                    b = None
+                if b is not None:
+                    b = float(b)
                     balance_after = b
                     delta = balance_before - b
                     if abs(delta - expected_total) <= tol:
                         confirmed = True
                         ticket_text = f"BALANCE_DECREASE {delta:.0f}"
                         break
-                except Exception:
-                    pass
-                page.wait_for_timeout(250)
+                    if (pending_payout is not None and
+                            abs(delta - (expected_total - pending_payout)) <= tol):
+                        confirmed = True
+                        ticket_text = (f"BALANCE_NET_WITH_PREVIOUS_WIN "
+                                       f"payout={pending_payout:.0f} stake={expected_total:.0f}")
+                        break
+                else:
+                    missing_balance += 1
+                # The site's balance widget can remain stale after the order
+                # succeeds. Reload once, never submit the order a second time.
+                if not refreshed and time.monotonic() >= refresh_at:
+                    refreshed = True
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=8000)
+                    except Exception as exc:
+                        refresh_error = type(exc).__name__
+                try:
+                    page.wait_for_timeout(250)
+                except Exception as exc:
+                    raise RealBetError("Mất trang khi xác nhận lệnh; cần đối soát", may_have_submitted=True) from exc
         else:
             success_sel = str(success_cfg.get("selector") or "").strip()
             success_text = str(success_cfg.get("text_contains") or "").strip()
@@ -484,7 +531,15 @@ class RealBetExecutor:
         result["ticket_text"] = ticket_text
         result["balance_after"] = balance_after
         if not confirmed:
-            raise RealBetError("Đã click submit nhưng không xác nhận được lệnh → STOP để tránh cược trùng", may_have_submitted=True)
+            observed = f"{balance_after:.0f}" if balance_after is not None else "không đọc được"
+            raise RealBetError(
+                f"Đã click submit nhưng chưa xác nhận được lệnh: số dư trước={balance_before:.0f}, "
+                f"số dư cuối={observed}, cần giảm={expected_total:.0f}, "
+                f"đã refresh={refreshed}, không đọc được={missing_balance} lần, "
+                f"lỗi refresh={refresh_error or 'không'}. "
+                "Kiểm tra lịch sử cược trên 88i trước khi START lại.",
+                may_have_submitted=True,
+            )
 
         result["ok"] = True
         return result

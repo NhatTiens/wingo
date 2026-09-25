@@ -1,0 +1,472 @@
+diff --git a/88i_realbet_config.json b/88i_realbet_config.json
+index 6ce1164..1136e0d 100644
+--- a/88i_realbet_config.json
++++ b/88i_realbet_config.json
+@@ -32,7 +32,8 @@
+   },
+   "success": {
+     "mode": "balance_decrease",
+-    "timeout_ms": 6000,
++    "timeout_ms": 12000,
++    "refresh_after_ms": 5000,
+     "balance_tolerance": 2
+   },
+   "ui_recovery": {
+@@ -52,4 +53,4 @@
+     "timeout_seconds": 600,
+     "poll_ms": 500
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/README.md b/README.md
+index 0b656b7..f39f092 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,30 @@
+ # v7.6.3 — Visible Manual Login Real Bet
+ 
++## Xác nhận cược và lệnh UNKNOWN
++
++Sau khi bấm đặt cược, writer đọc số dư trực tiếp trên trang hiện tại tối đa 12 giây.
++Nếu số dư chưa cập nhật sau 5 giây, writer tải lại trang đúng một lần, không gửi thêm lệnh.
++Chỉ khi số dư giảm đúng tổng tiền TOP7, lệnh mới được xác nhận `OPEN`.
++Nếu vẫn không xác nhận được thì lệnh là `UNKNOWN` và writer dừng để tránh cược trùng.
++Danh sách “Đặt cược thành công” trên website có thể gồm lệnh cũ nên không được dùng
++một mình để tự động gỡ `UNKNOWN` cho một kỳ cược cụ thể.
++
++Với lệnh `UNKNOWN` đã tồn tại: dừng writer, kiểm tra đúng **kỳ, 7 số và tổng tiền**
++trong lịch sử cược 88i. Xem dữ liệu DB trước (không sửa):
++
++```powershell
++python .\reconcile_real_bet.py --issue 202609252574
++```
++
++Chỉ khi website xác nhận đúng kỳ `202609252574`, bảy số `4,9,8,7,6,1,3`
++và tổng cược `21000`, đối soát (script tự tạo backup DB và chốt kết quả nếu đã có):
++
++```powershell
++python .\reconcile_real_bet.py --issue 202609252574 --mark-placed --expected-numbers 4,9,8,7,6,1,3 --expected-total 21000
++```
++
++Sau đó chạy lại writer, đăng nhập và bấm START TOOL. Không xóa DB để gỡ UNKNOWN.
++
+ Sửa UX của v7.6.2:
+ - Sau khi login thành công, xóa `last_error` cũ.
+ - Ghi ngay `current_balance` lên dashboard.
+diff --git a/reconcile_real_bet.py b/reconcile_real_bet.py
+new file mode 100644
+index 0000000..7db3cf1
+--- /dev/null
++++ b/reconcile_real_bet.py
+@@ -0,0 +1,87 @@
++"""Reconcile one UNKNOWN real bet after checking that exact order on 88i.
++
++Read-only unless --mark-placed is supplied. Run with the writer stopped.
++"""
++import argparse
++import json
++import sqlite3
++from pathlib import Path
++from types import SimpleNamespace
++
++
++def reconcile(db, issue, mark_placed=False, expected_numbers=None, expected_total=None):
++    path = Path(db)
++    if not path.is_file():
++        raise ValueError(f"Không tìm thấy DB: {path}")
++    with sqlite3.connect(path, timeout=10) as conn:
++        row = conn.execute(
++            "SELECT selected_numbers_json,stake_per_number,total_stake,status,balance_before,error_text "
++            "FROM real_bets WHERE issue=?", (str(issue),)
++        ).fetchone()
++        if row is None:
++            raise ValueError(f"Không có lệnh issue={issue} trong DB")
++        numbers = json.loads(row[0])
++        print(f"Issue: {issue} | số: {numbers} | cược mỗi số: {row[1]:,.0f} | "
++              f"tổng: {row[2]:,.0f} | trạng thái: {row[3]} | số dư trước: {row[4]}")
++        if not mark_placed:
++            return row[3]
++
++        if expected_numbers is None or expected_total is None:
++            raise ValueError("Cần --expected-numbers và --expected-total để xác nhận đúng lệnh")
++        if row[3] != "UNKNOWN":
++            raise ValueError(f"Chỉ đối soát trạng thái UNKNOWN, hiện là {row[3]}")
++        if numbers != expected_numbers or len(numbers) != 7 or len(set(numbers)) != 7:
++            raise ValueError("7 số trong DB không khớp lệnh đã kiểm tra trên 88i")
++        if abs(float(row[2]) - float(expected_total)) > 0.01:
++            raise ValueError("Tổng cược trong DB không khớp lệnh đã kiểm tra trên 88i")
++        if conn.execute("SELECT tool_running FROM runtime_control WHERE id=1").fetchone()[0]:
++            raise ValueError("Dừng writer trước khi đối soát DB")
++
++        backup_path = path.with_name(f"{path.stem}.before-reconcile-{issue}.db")
++        if backup_path.exists():
++            raise ValueError(f"Đã có file backup {backup_path}; không ghi đè")
++        with sqlite3.connect(backup_path) as backup:
++            conn.backup(backup)
++        conn.execute("BEGIN IMMEDIATE")
++        updated = conn.execute(
++            "UPDATE real_bets SET status='OPEN',ticket_text=?,error_text=NULL "
++            "WHERE issue=? AND status='UNKNOWN'",
++            ("MANUALLY_VERIFIED_88I", str(issue)),
++        )
++        if updated.rowcount != 1:
++            raise ValueError("Trạng thái lệnh đã thay đổi; chưa cập nhật")
++        known = conn.execute("SELECT number FROM results WHERE issue=?", (str(issue),)).fetchone()
++        if known:
++            # The same settlement logic used by the writer updates the session
++            # progression and accounting, including the 1-1-2-3 step.
++            import wingo_id77_adaptive_v7_6 as app
++            ctl_args = SimpleNamespace(real_stop_consecutive_losses=5,
++                                       real_stop_profit_pct=1.0,
++                                       real_stop_balance_floor_pct=.50,
++                                       real_stop_max_minutes=90)
++            app.settle_real_bet(conn, str(issue), int(known[0]), ctl_args)
++        else:
++            conn.commit()
++        status = conn.execute("SELECT status FROM real_bets WHERE issue=?", (str(issue),)).fetchone()[0]
++        print(f"Đã đối soát: {status} | backup: {backup_path}")
++        return status
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--db", default="wingo_88i_id77.db")
++    ap.add_argument("--issue", required=True)
++    ap.add_argument("--mark-placed", action="store_true",
++                    help="Chỉ dùng sau khi xác nhận đúng issue, 7 số và tổng cược ở lịch sử 88i")
++    ap.add_argument("--expected-numbers", help="Bảy số đúng thứ tự trong DB, ví dụ 4,9,8,7,6,1,3")
++    ap.add_argument("--expected-total", type=float)
++    a = ap.parse_args()
++    try:
++        expected_numbers = [int(s) for s in a.expected_numbers.split(",")] if a.expected_numbers else None
++        reconcile(a.db, a.issue, a.mark_placed, expected_numbers, a.expected_total)
++    except (ValueError, sqlite3.Error) as exc:
++        ap.exit(2, f"Không đối soát: {exc}\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/test_realbet.py b/test_realbet.py
+index ce85e00..6a07f5b 100644
+--- a/test_realbet.py
++++ b/test_realbet.py
+@@ -4,9 +4,13 @@ import tempfile
+ import unittest
+ from pathlib import Path
+ from types import SimpleNamespace
++from unittest.mock import patch
++
++import numpy as np
+ 
+ from wingo_realbet import RealBetError, RealBetExecutor
+ import wingo_id77_adaptive_v7_6 as app
++from reconcile_real_bet import reconcile
+ 
+ 
+ class FakeExecutor:
+@@ -32,20 +36,17 @@ class FakeExecutor:
+ 
+ def args():
+     return SimpleNamespace(
+-        real_bet_enabled=True, real_calibrated_min=.72, real_consensus_min=.60,
+-        real_stability_min=.80, real_max_drift=.40, real_live_required_samples=80,
+-        real_live_min_hit=.73, real_regime_required_samples=50,
+-        real_regime_min_hit=.73, real_stop_consecutive_losses=5,
++        real_bet_enabled=True, real_stop_consecutive_losses=5,
+         real_stop_profit_pct=1.0, real_stop_balance_floor_pct=.50,
+         real_stop_max_minutes=90, real_base_stake=3000,
+     )
+ 
+ 
+ def gate(**changes):
+-    base = {"passed": True, "data_health": "OK", "calibrated_prob": .75,
+-            "consensus_score": .65, "stability_score": .85, "drift_score": .2,
+-            "live_samples": 80, "live_hit_rate": .75, "regime_samples": 50,
+-            "regime_hit_rate": .75, "selected": [0, 1, 2, 3, 4, 5, 6]}
++    base = {"passed": True, "failed": [], "data_health": "OK", "calibrated_prob": .72,
++            "consensus_score": .55, "stability_score": .75, "drift_score": .45,
++            "live_samples": 80, "live_hit_rate": .72, "regime_samples": 50,
++            "regime_hit_rate": .72, "selected": [0, 1, 2, 3, 4, 5, 6]}
+     return dict(base, **changes)
+ 
+ 
+@@ -72,20 +73,51 @@ class RealWorkflowTests(unittest.TestCase):
+         app.settle_real_bet(self.conn, "123", 3, self.a)
+         self.assertEqual(self.conn.execute("SELECT status FROM real_bets").fetchone()[0], "WIN")
+         self.assertEqual(app.runtime_control(self.conn)["current_step"], 1)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "124", gate(), self.a, executor), "PLACED")
++        self.assertEqual(len(executor.calls), 2)
++
++    def test_real_decision_matches_actual_top7_gate_at_boundaries(self):
++        top_args = SimpleNamespace(
++            top7_calibration_lookback=500, top7_consensus_fraction=.70,
++            top7_live_lookback=80, top7_regime_lookback=80,
++            top7_calibrated_min=.72, top7_consensus_min=.55,
++            top7_stability_min=.75, top7_max_drift=.45,
++            top7_live_activate_samples=80, top7_live_min_hit=.72,
++            top7_regime_activate_samples=50, top7_regime_min_hit=.72,
++            top7_max_ece=.06,
++        )
++        with (patch.object(app, "top7_selection", return_value=(list(range(7)), [7, 8, 9], .72, 0)),
++              patch.object(app, "top7_calibration", return_value=(.72, None, 0, 0)),
++              patch.object(app, "top7_consensus", return_value=(.55, 2, {}, 1)),
++              patch.object(app, "top7_stability", return_value=(.75, {})),
++              patch.object(app, "top7_live_stats", side_effect=[
++                  {"n": 80, "hit_rate": .72}, {"n": 50, "hit_rate": .72}])):
++            actual_gate = app.top7_gate(self.conn, np.ones(10) / 10, {}, np.array([0]),
++                                        "BALANCED", "OK", .45, top_args)
++        self.assertTrue(actual_gate["passed"])
++        self.assertEqual(app.real_gate_check(actual_gate), (True, []))
++        actual_gate["passed"] = False
++        actual_gate["failed"] = ["live_hit_ok"]
++        self.assertEqual(app.real_gate_check(actual_gate), (False, ["live_hit_ok"]))
+ 
+     def test_failed_gate_never_calls_executor(self):
+         executor = FakeExecutor()
+-        status = app.maybe_place_real_bet(self.conn, "123", gate(consensus_score=.5), self.a, executor)
+-        self.assertEqual(status, "REAL_GATE_SKIP:CONSENSUS")
++        status = app.maybe_place_real_bet(self.conn, "123", gate(passed=False, failed=["consensus_ok"], consensus_score=.5), self.a, executor)
++        self.assertEqual(status, "TOP7_GATE_SKIP:consensus_ok")
+         self.assertEqual(executor.calls, [])
+         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM real_bets").fetchone()[0], 0)
+ 
+     def test_live_hit_gate_blocks_after_required_samples(self):
+         executor = FakeExecutor()
+-        status = app.maybe_place_real_bet(self.conn, "123", gate(live_hit_rate=.70), self.a, executor)
+-        self.assertEqual(status, "REAL_GATE_SKIP:LIVE_HIT")
++        status = app.maybe_place_real_bet(self.conn, "123", gate(passed=False, failed=["live_hit_ok"], live_hit_rate=.70), self.a, executor)
++        self.assertEqual(status, "TOP7_GATE_SKIP:live_hit_ok")
+         self.assertEqual(executor.calls, [])
+ 
++    def test_warmup_gate_passes(self):
++        executor = FakeExecutor()
++        warmup = gate(live_samples=0, live_hit_rate=None, regime_samples=0, regime_hit_rate=None)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "123", warmup, self.a, executor), "PLACED")
++
+     def test_stop_loss_blocks_even_if_gate_passes(self):
+         self.conn.execute("UPDATE runtime_control SET current_loss_streak=5 WHERE id=1")
+         self.conn.commit()
+@@ -116,6 +148,29 @@ class RealWorkflowTests(unittest.TestCase):
+         self.assertEqual(app.runtime_control(self.conn)["real_bet_armed"], 0)
+ 
+ 
++class ReconciliationTests(unittest.TestCase):
++    def test_confirmed_unknown_settles_once_and_preserves_backup(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            db = Path(tmp) / "test.db"
++            conn = app.init_db(db, 525000, 3000)
++            conn.execute("INSERT INTO real_bets(issue,step_index,unit_multiplier,selected_numbers_json,"
++                         "stake_per_number,total_stake,odds,status,created_at) "
++                         "VALUES('123',0,1,'[0, 1, 2, 3, 4, 5, 6]',3000,21000,9.895,'UNKNOWN','now')")
++            conn.execute("INSERT INTO results VALUES('123',3,'small','green','now','offline')")
++            conn.commit()
++            self.assertEqual(reconcile(db, "123"), "UNKNOWN")
++            with self.assertRaisesRegex(ValueError, "Tổng cược"):
++                reconcile(db, "123", True, list(range(7)), 7000)
++            self.assertEqual(reconcile(db, "123", True, list(range(7)), 21000), "WIN")
++            self.assertEqual(conn.execute("SELECT status FROM real_bets WHERE issue='123'").fetchone()[0], "WIN")
++            self.assertEqual(app.runtime_control(conn)["session_bets"], 1)
++            self.assertEqual(app.runtime_control(conn)["current_step"], 1)
++            self.assertTrue((Path(tmp) / "test.before-reconcile-123.db").is_file())
++            with self.assertRaisesRegex(ValueError, "Chỉ đối soát"):
++                reconcile(db, "123", True, list(range(7)), 21000)
++            conn.close()
++
++
+ class Locator:
+     def __init__(self, page, selector):
+         self.page, self.selector = page, selector
+@@ -141,7 +196,7 @@ class Locator:
+             self.page.submit_count += 1
+             if self.page.click_timeout:
+                 raise TimeoutError("click timed out after dispatch")
+-            self.page.balance -= 70
++            self.page.balance -= self.page.submit_debit
+ 
+     def fill(self, value):
+         self.page.filled = value
+@@ -158,14 +213,25 @@ class Page:
+         self.selected = 0
+         self.submit_count = 0
+         self.balance = 1000
++        self.submit_debit = 70
+         self.clear_broken = False
+         self.click_timeout = False
++        self.stale_until_reload = False
++        self.refresh_count = 0
++        self.wait_count = 0
++        self.close_after_submit = False
+ 
+     def locator(self, selector):
+         return Locator(self, selector)
+ 
+     def wait_for_timeout(self, ms):
+-        pass
++        if self.close_after_submit and self.submit_count:
++            raise RuntimeError("page closed")
++        self.wait_count += 1
++
++    def reload(self, **kwargs):
++        self.refresh_count += 1
++        self.stale_until_reload = False
+ 
+     def bring_to_front(self):
+         pass
+@@ -181,6 +247,13 @@ class OfflineExecutor(RealBetExecutor):
+         return self.fake_page
+ 
+     def read_balance(self):
++        if self.fake_page.submit_count:
++            raise AssertionError("Không được điều hướng bằng read_balance() sau submit")
++        return self.fake_page.balance
++
++    def _balance_visible_value(self):
++        if self.fake_page.stale_until_reload:
++            return self.fake_page.balance + 70
+         return self.fake_page.balance
+ 
+     def ensure_number_panel(self):
+@@ -204,7 +277,7 @@ class BrowserFlowTests(unittest.TestCase):
+                           "number_button_selector_template": "num_{n}"},
+             "stake": {"shared_input_selector": "shared"},
+             "submit": {"selector": "submit"}, "total": {"selector": "total"},
+-            "success": {"mode": "balance_decrease", "timeout_ms": 100}
++            "success": {"mode": "balance_decrease", "timeout_ms": 100, "refresh_after_ms": 0}
+         }))
+         self.page = Page()
+         self.executor = OfflineExecutor(self.path, self.page)
+@@ -223,6 +296,28 @@ class BrowserFlowTests(unittest.TestCase):
+             self.executor.place_top7("123", list(range(7)), 10, 70)
+         self.assertEqual(self.page.submit_count, 0)
+ 
++    def test_stale_balance_refreshes_once_and_confirms_without_second_submit(self):
++        self.page.stale_until_reload = True
++        result = self.executor.place_top7("123", list(range(7)), 10, 70)
++        self.assertTrue(result["confirmed"])
++        self.assertEqual(result["balance_after"], 930)
++        self.assertEqual((self.page.refresh_count, self.page.submit_count), (1, 1))
++
++    def test_no_exact_debit_keeps_submission_unknown(self):
++        self.page.submit_debit = 50
++        self.page.stale_until_reload = True
++        with self.assertRaises(RealBetError) as result:
++            self.executor.place_top7("123", list(range(7)), 10, 70)
++        self.assertTrue(result.exception.may_have_submitted)
++        self.assertEqual(self.page.submit_count, 1)
++
++    def test_page_closes_after_submit_is_unknown_without_retry(self):
++        self.page.close_after_submit = True
++        with self.assertRaises(RealBetError) as result:
++            self.executor.place_top7("123", list(range(7)), 10, 70)
++        self.assertTrue(result.exception.may_have_submitted)
++        self.assertEqual(self.page.submit_count, 1)
++
+     def test_out_of_range_number_rejected(self):
+         with self.assertRaisesRegex(RealBetError, "TOP7 không hợp lệ"):
+             self.executor.place_top7("123", [0, 1, 2, 3, 4, 5, 10], 10, 70)
+diff --git a/wingo_realbet.py b/wingo_realbet.py
+index 554ea7d..134fec0 100644
+--- a/wingo_realbet.py
++++ b/wingo_realbet.py
+@@ -425,40 +425,71 @@ class RealBetExecutor:
+             # uncertain submission so a later START cannot silently retry it.
+             raise RealBetError("Không rõ click submit đã gửi lệnh hay chưa", may_have_submitted=True) from exc
+         result["submitted"] = True
+-        page.wait_for_timeout(int(timing.get("after_submit_ms", 500)))
++        try:
++            page.wait_for_timeout(int(timing.get("after_submit_ms", 500)))
++        except Exception as exc:
++            raise RealBetError("Mất trang sau submit; cần đối soát lệnh", may_have_submitted=True) from exc
+ 
+         confirm_cfg = cfg.get("confirm") or {}
+         confirm_sel = str(confirm_cfg.get("selector") or "").strip()
+         if confirm_sel:
+-            confirm = page.locator(confirm_sel)
+-            if confirm.count() == 1 and confirm.first.is_visible():
+-                confirm.first.click()
+-                page.wait_for_timeout(int(timing.get("after_confirm_ms", 700)))
+-            elif bool(confirm_cfg.get("required", False)):
+-                raise RealBetError("Đã click submit nhưng không tìm thấy confirm", may_have_submitted=True)
++            try:
++                confirm = page.locator(confirm_sel)
++                if confirm.count() == 1 and confirm.first.is_visible():
++                    confirm.first.click()
++                    page.wait_for_timeout(int(timing.get("after_confirm_ms", 700)))
++                elif bool(confirm_cfg.get("required", False)):
++                    raise RealBetError("Đã click submit nhưng không tìm thấy confirm", may_have_submitted=True)
++            except RealBetError:
++                raise
++            except Exception as exc:
++                raise RealBetError("Không rõ confirm đã gửi lệnh chưa", may_have_submitted=True) from exc
+ 
+         success_cfg = cfg.get("success") or {}
+         mode = str(success_cfg.get("mode") or "balance_decrease")
+-        timeout_ms = int(success_cfg.get("timeout_ms", 5000))
++        timeout_ms = int(success_cfg.get("timeout_ms", 12000))
+         confirmed = False
+         ticket_text = None
+         balance_after = None
+ 
+         if mode == "balance_decrease":
+             deadline = time.monotonic() + timeout_ms / 1000.0
++            refresh_after_ms = int(success_cfg.get("refresh_after_ms", 5000))
++            refresh_at = time.monotonic() + refresh_after_ms / 1000.0
+             tol = float(success_cfg.get("balance_tolerance", 2.0))
++            refreshed = False
++            missing_balance = 0
++            refresh_error = None
+             while time.monotonic() < deadline:
++                # Reading through read_balance() could navigate away from the
++                # post-submit page when the site changes its URL. Keep that
++                # page intact while waiting for the debit to appear.
+                 try:
+-                    b = float(self.read_balance())
++                    b = self._balance_visible_value()
++                except Exception:
++                    b = None
++                if b is not None:
++                    b = float(b)
+                     balance_after = b
+                     delta = balance_before - b
+                     if abs(delta - expected_total) <= tol:
+                         confirmed = True
+                         ticket_text = f"BALANCE_DECREASE {delta:.0f}"
+                         break
+-                except Exception:
+-                    pass
+-                page.wait_for_timeout(250)
++                else:
++                    missing_balance += 1
++                # The site's balance widget can remain stale after the order
++                # succeeds. Reload once, never submit the order a second time.
++                if not refreshed and time.monotonic() >= refresh_at:
++                    refreshed = True
++                    try:
++                        page.reload(wait_until="domcontentloaded", timeout=8000)
++                    except Exception as exc:
++                        refresh_error = type(exc).__name__
++                try:
++                    page.wait_for_timeout(250)
++                except Exception as exc:
++                    raise RealBetError("Mất trang khi xác nhận lệnh; cần đối soát", may_have_submitted=True) from exc
+         else:
+             success_sel = str(success_cfg.get("selector") or "").strip()
+             success_text = str(success_cfg.get("text_contains") or "").strip()
+@@ -484,7 +515,15 @@ class RealBetExecutor:
+         result["ticket_text"] = ticket_text
+         result["balance_after"] = balance_after
+         if not confirmed:
+-            raise RealBetError("Đã click submit nhưng không xác nhận được lệnh → STOP để tránh cược trùng", may_have_submitted=True)
++            observed = f"{balance_after:.0f}" if balance_after is not None else "không đọc được"
++            raise RealBetError(
++                f"Đã click submit nhưng chưa xác nhận được lệnh: số dư trước={balance_before:.0f}, "
++                f"số dư cuối={observed}, cần giảm={expected_total:.0f}, "
++                f"đã refresh={refreshed}, không đọc được={missing_balance} lần, "
++                f"lỗi refresh={refresh_error or 'không'}. "
++                "Kiểm tra lịch sử cược trên 88i trước khi START lại.",
++                may_have_submitted=True,
++            )
+ 
+         result["ok"] = True
+         return result

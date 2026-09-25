@@ -1,0 +1,273 @@
+diff --git a/README.md b/README.md
+index e157bfb..7d09f1a 100644
+--- a/README.md
++++ b/README.md
+@@ -16,6 +16,7 @@ Bản này được cấu hình theo yêu cầu:
+ - Tool không nhận, không ghi file và không lưu username/password.
+ - Sau login, Chromium giữ mở để bạn nhìn thấy chọn TOP7, nhập tiền và click Đặt Cược.
+ - `dry_run=false`: đây là chế độ cược tiền thật.
++- Luồng cược thật chỉ chọn 7 số TOP7 và đặt cùng mức tiền cho mỗi số. Mặc định paper bet Lớn/Nhỏ cũng tắt; các xác suất Lớn/Nhỏ vẫn được in để quan sát.
+ - Writer restart luôn STOPPED/DISARMED; login thành công không tự đặt cược. Bạn vẫn phải tick xác nhận và bấm START TOOL trên dashboard.
+ 
+ ## Điều kiện STOP mặc định
+@@ -63,3 +64,7 @@ Hãy restart writer để mở Chromium sạch, đăng nhập lại rồi START
+ ## Lưu ý
+ 
+ `dry_run=false` trong package này vì đây là bản visible real-bet theo yêu cầu. START TOOL vẫn là công tắc bắt buộc.
++
++Cược thật dùng trực tiếp kết quả PASS của TOP7 Gate. Ngưỡng tương ứng là data health OK, calibrated P(hit) ≥72%, consensus ≥55%, stability ≥75%, drift ≤0,45, live hit ≥72% khi có 80 mẫu và regime hit ≥72% khi có 50 mẫu. Trước khi đủ số mẫu, hai chỉ số hit đang WARMUP và chưa chặn cược. Các điều kiện đăng nhập, thời gian còn mở, đủ số dư, một cược mỗi kỳ và giới hạn dừng phiên vẫn được kiểm tra.
++
++Kiểm thử offline, không chạm website và không gửi lệnh tiền thật: `python -m unittest -v test_realbet`. Các kiểm thử xác nhận gate, giỏ 7 số, trạng thái END, kỳ cược đổi, giỏ cũ, dry run, cược trùng và xác nhận lệnh. Việc trang 88i thực tế có còn đúng selector và hiển thị tổng tiền như cấu hình chỉ xác nhận được khi chạy dry run trên tài khoản đã đăng nhập.
+diff --git a/wingo_dashboard_v7_6.py b/wingo_dashboard_v7_6.py
+index 27ffbf5..858610f 100644
+--- a/wingo_dashboard_v7_6.py
++++ b/wingo_dashboard_v7_6.py
+@@ -192,7 +192,7 @@ st.caption(
+     f"· số dư ≤ {start_settings['stop_balance_floor_pct']*100:.0f}% vốn lúc START · {start_settings['stop_max_minutes']:.0f} phút "
+     f"· submit tại countdown second {start_settings['bet_second']}."
+ )
+-confirm=st.checkbox("Tôi xác nhận START sẽ cho phép chiến thuật 1-1-2-3 đặt cược thật khi config dry_run=false và Real Gate PASS.")
++confirm=st.checkbox("Tôi xác nhận START sẽ cho phép chiến thuật 1-1-2-3 đặt cược thật khi config dry_run=false và TOP7 Gate PASS.")
+ 
+ start_blockers=[]
+ if not confirm: start_blockers.append("chưa tick xác nhận")
+@@ -397,7 +397,7 @@ Live/Regime luôn dùng tối đa 80 mẫu gần nhất: mẫu mới vào thì m
+         bsec=int(ctl2.get('bet_second') or DEFAULT_REAL_SETTINGS['bet_second'])
+         st.markdown(f"**STOP đang dùng:** {loss_lim} LOSS liên tiếp · balance đạt +{prof:.0f}% so với lúc START · balance giảm còn {floor:.0f}% vốn lúc START · {mins:.0f} phút · lỗi login/balance/0-9/selector/tổng tiền/xác nhận → STOP.")
+         st.caption(f"Prediction chạy sớm; real submit được lên lịch tại countdown second {bsec}. Không có giới hạn số lệnh.")
+-        st.markdown("**Real Gate chặt hơn paper:** Calibrated ≥72% · Consensus ≥60% · Stability ≥80% · Drift ≤0,40 · Live80 ≥73% đủ 80 mẫu · Regime ≥73% đủ 50 mẫu · Health=OK.")
++        st.markdown("**Cược thật dùng đúng TOP7 Gate:** Health=OK · Calibrated ≥72% · Consensus ≥55% · Stability ≥75% · Drift ≤0,45 · Live hit ≥72% khi đủ 80 mẫu · Regime hit ≥72% khi đủ 50 mẫu.")
+         if realbets is None or realbets.empty:
+             st.info("Chưa có real bet audit. Có thể START ở dry-run sau khi config selector.")
+         else:
+diff --git a/wingo_id77_adaptive_v7_6.py b/wingo_id77_adaptive_v7_6.py
+index 166ca69..fd49a64 100644
+--- a/wingo_id77_adaptive_v7_6.py
++++ b/wingo_id77_adaptive_v7_6.py
+@@ -859,24 +859,11 @@ def ensure_real_session(conn,args,executor):
+     return True
+ 
+ 
+-def real_gate_check(gate,args):
+-    failed=[]
+-    if not gate.get("passed"): failed.append("TOP7_GATE")
+-    if str(gate.get("data_health") or "")!="OK": failed.append("DATA_HEALTH")
+-    if float(gate.get("calibrated_prob") or 0)<args.real_calibrated_min: failed.append("CALIBRATED")
+-    if float(gate.get("consensus_score") or 0)<args.real_consensus_min: failed.append("CONSENSUS")
+-    if float(gate.get("stability_score") or 0)<args.real_stability_min: failed.append("STABILITY")
+-    if float(gate.get("drift_score") or 999)>args.real_max_drift: failed.append("DRIFT")
+-    live_n = int(gate.get("live_samples") or 0)
+-    if live_n >= args.real_live_required_samples:
+-        if float(gate.get("live_hit_rate") or 0) < args.real_live_min_hit:
+-            failed.append("LIVE_HIT")
+-
+-    regime_n = int(gate.get("regime_samples") or 0)
+-    if regime_n >= args.real_regime_required_samples:
+-        if float(gate.get("regime_hit_rate") or 0) < args.real_regime_min_hit:
+-            failed.append("REGIME_HIT")
+-    return len(failed)==0,failed
++def real_gate_check(gate):
++    """Cược thật dùng đúng quyết định và lý do của TOP7 Gate."""
++    if gate.get("passed") is True:
++        return True, []
++    return False, list(gate.get("failed") or ["TOP7_GATE"])
+ 
+ 
+ def real_auto_stop_reason(ctl,args,balance=None):
+@@ -940,7 +927,7 @@ def settle_real_bet(conn,issue,n,args):
+         stop_real_tool(conn,reason)
+ 
+ 
+-def maybe_place_real_bet(conn,issue,gate,args,executor):
++def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
+     ctl=runtime_control(conn)
+     if not ctl or not int(ctl.get("tool_running") or 0) or not int(ctl.get("real_bet_armed") or 0):
+         return "STOPPED"
+@@ -956,9 +943,9 @@ def maybe_place_real_bet(conn,issue,gate,args,executor):
+     if reason:
+         stop_real_tool(conn,reason)
+         return reason
+-    ok,failed=real_gate_check(gate,args)
++    ok,failed=real_gate_check(gate)
+     if not ok:
+-        return "REAL_GATE_SKIP:"+",".join(failed)
++        return "TOP7_GATE_SKIP:"+",".join(failed)
+     ctl=runtime_control(conn)
+     reason=real_auto_stop_reason(ctl,args,balance=balance)
+     if reason:
+@@ -979,7 +966,16 @@ def maybe_place_real_bet(conn,issue,gate,args,executor):
+         (str(issue),step,unit,json.dumps(gate["selected"]),stake_per,total,TOP7_ODDS,gate.get("calibrated_prob"),"PREPARED",balance,created))
+     conn.commit()
+     try:
+-        result=executor.place_top7(str(issue),gate["selected"],stake_per,total)
++        def before_submit():
++            current=runtime_control(conn)
++            if (not current or not int(current.get("tool_running") or 0)
++                    or not int(current.get("real_bet_armed") or 0)):
++                raise RealBetError("Tool đã END/STOP trong lúc chuẩn bị giỏ")
++            if real_auto_stop_reason(current,args,balance=current.get("current_balance")):
++                raise RealBetError("Điều kiện dừng đã kích hoạt trước submit")
++            if submit_guard is not None:
++                submit_guard()
++        result=executor.place_top7(str(issue),gate["selected"],stake_per,total,before_submit=before_submit)
+         if bool(result.get("dry_run")):
+             conn.execute("""UPDATE real_bets SET status='DRY_RUN',balance_after_submit=?,ticket_text=?,error_text=? WHERE issue=?""",
+                          (result.get("balance_after"),result.get("ticket_text"),"DRY_RUN: submit không được click",str(issue)))
+@@ -1428,7 +1424,7 @@ def main():
+     ap.add_argument("--db",default="wingo_88i_id77.db"); ap.add_argument("--csv",default="wingo_88i_id77.csv")
+     ap.add_argument("--bets-csv",default="wingo_paper_bets.csv"); ap.add_argument("--predictions-csv",default="wingo_predictions.csv"); ap.add_argument("--performance-csv",default="wingo_model_performance.csv")
+     ap.add_argument("--trigger-second",type=int,default=20); ap.add_argument("--poll",type=float,default=.12)
+-    ap.add_argument("--paper-market",choices=["off","size","color","number","best"],default="size")
++    ap.add_argument("--paper-market",choices=["off","size","color","number","best"],default="off")
+     ap.add_argument("--signal-threshold",type=float,default=.55); ap.add_argument("--min-edge",type=float,default=.05)
+     ap.add_argument("--stake",type=float,default=50000); ap.add_argument("--bankroll",type=float,default=1000000)
+     ap.add_argument("--performance-lookback",type=int,default=300); ap.add_argument("--min-live-predictions",type=int,default=30)
+@@ -1479,14 +1475,6 @@ def main():
+     ap.add_argument("--real-profile-dir",default="88i_browser_profile",help="Chỉ dùng khi login.mode=persistent; manual_each_run không cần profile")
+     ap.add_argument("--real-base-stake",type=float,default=3000)
+     ap.add_argument("--real-bet-second",type=int,default=10,help="API countdown second để submit real bet; dashboard có thể override khi START")
+-    ap.add_argument("--real-calibrated-min",type=float,default=.72)
+-    ap.add_argument("--real-consensus-min",type=float,default=.60)
+-    ap.add_argument("--real-stability-min",type=float,default=.80)
+-    ap.add_argument("--real-max-drift",type=float,default=.40)
+-    ap.add_argument("--real-live-min-hit",type=float,default=.73)
+-    ap.add_argument("--real-live-required-samples",type=int,default=80)
+-    ap.add_argument("--real-regime-min-hit",type=float,default=.73)
+-    ap.add_argument("--real-regime-required-samples",type=int,default=50)
+     ap.add_argument("--real-stop-consecutive-losses",type=int,default=5)
+     ap.add_argument("--real-stop-profit-pct",type=float,default=1.0,help="1.0 = +100 phần trăm so với balance lúc START")
+     ap.add_argument("--real-stop-balance-floor-pct",type=float,default=.50,help="0.50 = dừng khi còn 50 phần trăm balance lúc START")
+@@ -1560,7 +1548,13 @@ def main():
+                             pbet,_=wait_to_target(s,li,bet_sec,args.poll)
+                             bi=timing(pbet) if pbet else li
+                         if bi["issue"]==info["issue"] and bi["second"]<=bet_sec and bi["second"]>int(bi.get("close",3)):
+-                            status=maybe_place_real_bet(conn,info["issue"],gate,args,real_executor)
++                            def current_issue_guard():
++                                current=timing(fetch(s))
++                                if (current["issue"]!=info["issue"]
++                                        or current["second"]<=int(current["close"])+1):
++                                    raise RealBetError("Kỳ cược đã đổi hoặc quá sát giờ khóa cược")
++                            status=maybe_place_real_bet(conn,info["issue"],gate,args,real_executor,
++                                                        submit_guard=current_issue_guard)
+                             print(f"[REAL @ second={bi['second']:02d}] {status}")
+                             export_real_bets(conn,args)
+                         else:
+diff --git a/wingo_realbet.py b/wingo_realbet.py
+index eb9f50d..554ea7d 100644
+--- a/wingo_realbet.py
++++ b/wingo_realbet.py
+@@ -6,7 +6,7 @@ import json
+ import re
+ import time
+ from pathlib import Path
+-from typing import Any
++from typing import Any, Callable
+ 
+ 
+ class RealBetError(RuntimeError):
+@@ -79,10 +79,20 @@ class RealBetExecutor:
+             return False, f"Thiếu persistent profile: {self.profile_dir}"
+         if login_mode == "manual_each_run" and bool(cfg.get("headless", False)):
+             return False, "manual_each_run yêu cầu headless=false để người dùng đăng nhập trên Chromium"
++        if str(cfg.get("target_url") or "") != "https://www.88idd.com/home/#/lottery?tabName=Lottery&id=77":
++            return False, "target_url phải là trang Wingo id=77 đã kiểm tra"
++        if str((cfg.get("selection") or {}).get("expected_selected_count", "")) != "7":
++            return False, "expected_selected_count phải bằng 7"
++        if str((cfg.get("stake") or {}).get("expected_row_inputs", "")) != "7":
++            return False, "expected_row_inputs phải bằng 7"
++        if str((cfg.get("success") or {}).get("mode") or "") != "balance_decrease":
++            return False, "Xác nhận cược thật phải dùng balance_decrease"
+ 
+         required = {
+             "balance.selector": (cfg.get("balance") or {}).get("selector"),
+             "selection.number_button_selector_template": (cfg.get("selection") or {}).get("number_button_selector_template"),
++            "selection.selected_selector": (cfg.get("selection") or {}).get("selected_selector"),
++            "selection.clear_selector": (cfg.get("selection") or {}).get("clear_selector"),
+             "stake.shared_input_selector": (cfg.get("stake") or {}).get("shared_input_selector"),
+             "stake.row_input_selector": (cfg.get("stake") or {}).get("row_input_selector"),
+             "total.selector": (cfg.get("total") or {}).get("selector"),
+@@ -211,7 +221,8 @@ class RealBetExecutor:
+     def _goto(self, force=False):
+         page = self.page
+         url = str(self.cfg.get("target_url") or "https://www.88idd.com/home/#/lottery?tabName=Lottery&id=77")
+-        if force or not page.url.startswith("https://www.88idd.com/"):
++        # A logged-in page for another lottery or another tab is not our target.
++        if force or page.url != url:
+             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+             page.wait_for_timeout(int((self.cfg.get("timing") or {}).get("page_ready_ms", 1800)))
+         return page
+@@ -298,8 +309,10 @@ class RealBetExecutor:
+                 raise RealBetError(f"Stake row {i+1}={v:.0f}, expected={expected:.0f}")
+         return vals
+ 
+-    def place_top7(self, issue: str, numbers: list[int], stake_per_number: float, expected_total: float) -> dict[str, Any]:
+-        if len(numbers) != 7 or len(set(int(x) for x in numbers)) != 7:
++    def place_top7(self, issue: str, numbers: list[int], stake_per_number: float, expected_total: float,
++                   before_submit: Callable[[], None] | None = None) -> dict[str, Any]:
++        if (len(numbers) != 7 or any(type(x) is not int or x not in range(10) for x in numbers)
++                or len(set(numbers)) != 7):
+             raise RealBetError(f"TOP7 không hợp lệ: {numbers}")
+         if stake_per_number <= 0 or expected_total <= 0:
+             raise RealBetError("Stake không hợp lệ")
+@@ -325,11 +338,17 @@ class RealBetExecutor:
+ 
+         # Xóa giỏ cũ nếu đang còn lựa chọn từ lần trước.
+         clear_sel = str(selection.get("clear_selector") or "").strip()
+-        if clear_sel:
+-            clear_loc = page.locator(clear_sel)
+-            if clear_loc.count() == 1 and clear_loc.first.is_visible():
+-                clear_loc.first.click()
+-                page.wait_for_timeout(200)
++        selected_sel = str(selection.get("selected_selector") or "").strip()
++        if not selected_sel:
++            raise RealBetError("Thiếu selected_selector để xác nhận giỏ chỉ chứa TOP7")
++        if page.locator(selected_sel).count():
++            clear_loc = page.locator(clear_sel) if clear_sel else None
++            if clear_loc is None or clear_loc.count() != 1 or not clear_loc.first.is_visible():
++                raise RealBetError("Giỏ đang có lựa chọn và không thể xóa an toàn")
++            clear_loc.first.click()
++            page.wait_for_timeout(200)
++            if page.locator(selected_sel).count():
++                raise RealBetError("Giỏ vẫn còn lựa chọn sau khi xóa")
+ 
+         template = str(selection.get("number_button_selector_template") or "").strip()
+         for n in numbers:
+@@ -338,12 +357,9 @@ class RealBetExecutor:
+             el.click()
+             page.wait_for_timeout(int(timing.get("between_number_click_ms", 120)))
+ 
+-        selected_sel = str(selection.get("selected_selector") or "").strip()
+-        if selected_sel:
+-            count = page.locator(selected_sel).count()
+-            expected_count = int(selection.get("expected_selected_count", 7))
+-            if count != expected_count:
+-                raise RealBetError(f"Selected-count mismatch: web={count}, expected={expected_count}")
++        count = page.locator(selected_sel).count()
++        if count != 7:
++            raise RealBetError(f"Selected-count mismatch: web={count}, expected=7")
+ 
+         shared = self._one(page, str(stake_cfg.get("shared_input_selector") or ""), "shared stake input")
+         shared.click()
+@@ -392,6 +408,8 @@ class RealBetExecutor:
+         latest_cfg = load_config(self.config_path)
+         if not bool(latest_cfg.get("enabled", False)) or bool(latest_cfg.get("dry_run", True)):
+             raise RealBetError("Config đổi sang disabled/dry_run trước submit → hủy lệnh")
++        if before_submit is not None:
++            before_submit()
+ 
+         submit_sel = str((cfg.get("submit") or {}).get("selector") or "").strip()
+         submit = self._one(page, submit_sel, "submit")
+@@ -400,7 +418,12 @@ class RealBetExecutor:
+             page.bring_to_front()
+         except Exception:
+             pass
+-        submit.click()
++        try:
++            submit.click()
++        except Exception as exc:
++            # Playwright can time out after dispatching the click. Treat it as an
++            # uncertain submission so a later START cannot silently retry it.
++            raise RealBetError("Không rõ click submit đã gửi lệnh hay chưa", may_have_submitted=True) from exc
+         result["submitted"] = True
+         page.wait_for_timeout(int(timing.get("after_submit_ms", 500)))
+ 

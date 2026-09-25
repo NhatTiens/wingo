@@ -16,6 +16,7 @@ MODEL_NAMES = ["rolling","markov1","markov2","markov3","logistic","random_forest
 PRIORS = {"rolling":.25,"markov1":.20,"markov2":.18,"markov3":.12,"logistic":.10,"random_forest":.08,"hist_gradient_boosting":.07}
 TOP7_ODDS = 9.895
 TOP7_COUNT = 7
+REAL_BET_MULTIPLIERS = (1, 3, 4, 5)
 TOP7_BREAK_EVEN = TOP7_COUNT / TOP7_ODDS
 
 def now(): return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -880,33 +881,18 @@ def real_gate_check(gate):
     return False, list(gate.get("failed") or ["TOP7_GATE"])
 
 
-def real_auto_stop_reason(ctl,args,balance=None):
-    if ctl is None:return "NO_CONTROL_STATE"
-
-    loss_limit=max(1,_runtime_num(ctl,"stop_consecutive_losses",args.real_stop_consecutive_losses,int))
-    if int(ctl.get("current_loss_streak") or 0)>=loss_limit:
-        return f"LOSS_STREAK_{int(ctl.get('current_loss_streak') or 0)}"
-
-    start=ctl.get("session_start_balance")
-    if start is not None and float(start)>0 and balance is not None:
-        start=float(start); balance=float(balance)
-        profit_pct=max(0.0,_runtime_num(ctl,"stop_profit_pct",args.real_stop_profit_pct,float))
-        floor_pct=max(0.0,min(1.0,_runtime_num(ctl,"stop_balance_floor_pct",args.real_stop_balance_floor_pct,float)))
-        if profit_pct>0 and balance>=start*(1.0+profit_pct):
-            return "BALANCE_PROFIT_TARGET"
-        if floor_pct>0 and balance<=start*floor_pct:
-            return "BALANCE_FLOOR_LIMIT"
-
-    max_minutes=max(0.0,_runtime_num(ctl,"stop_max_minutes",args.real_stop_max_minutes,float))
-    if max_minutes>0 and _started_seconds_ago(ctl.get("started_at"))>=max_minutes*60:
-        return "MAX_SESSION_TIME"
-    return None
-
-
 def settle_real_bet(conn,issue,n,args):
     row=conn.execute("""SELECT id,step_index,selected_numbers_json,stake_per_number,total_stake,odds,status
         FROM real_bets WHERE issue=? AND status='OPEN'""",(issue,)).fetchone()
-    if not row:return
+    if not row:
+        # A draw can be recorded even if the website never confirmed the order.
+        # Keep UNKNOWN so an unverified order is never counted as a real win.
+        if conn.execute("""SELECT 1 FROM real_bets WHERE issue=? AND status='UNKNOWN'
+            AND actual_number IS NULL""",(str(issue),)).fetchone():
+            conn.execute("""UPDATE real_bets SET actual_number=?,resolved_at=?
+                WHERE issue=? AND status='UNKNOWN' AND actual_number IS NULL""",(int(n),now(),str(issue)))
+            conn.commit()
+        return
     bid,step,js,stake_per,total,odds,status=row
     try:selected=[int(x) for x in json.loads(js)]
     except Exception:selected=[]
@@ -920,27 +906,18 @@ def settle_real_bet(conn,issue,n,args):
     cls=int(ctl.get("current_loss_streak") or 0)
     lls=int(ctl.get("longest_loss_streak") or 0)
     if won:
-        next_step=int(step)+1 if int(step)+1<4 else 0
+        next_step=0
         cws+=1; cls=0
     else:
-        next_step=0; cws=0; cls+=1; lls=max(lls,cls)
-
-    # balance_after_submit đã trừ stake. Khi kỳ resolve, website cộng payout nếu WIN.
-    curbal=ctl.get("current_balance")
-    expected_balance=(float(curbal)+payout) if curbal is not None else None
+        next_step=min(int(step)+1,len(REAL_BET_MULTIPLIERS)-1)
+        cws=0; cls+=1; lls=max(lls,cls)
 
     conn.execute("""UPDATE real_bets SET status=?,actual_number=?,payout=?,profit=?,resolved_at=? WHERE id=?""",
                  ("WIN" if won else "LOSS",int(n),payout,profit,now(),bid))
     conn.execute("""UPDATE runtime_control SET session_profit=?,session_bets=?,current_step=?,
-        current_win_streak=?,current_loss_streak=?,longest_loss_streak=?,current_balance=COALESCE(?,current_balance),updated_at=? WHERE id=1""",
-                 (spl,bets,next_step,cws,cls,lls,expected_balance,now()))
+        current_win_streak=?,current_loss_streak=?,longest_loss_streak=?,updated_at=? WHERE id=1""",
+                 (spl,bets,next_step,cws,cls,lls,now()))
     conn.commit()
-    ctl=runtime_control(conn)
-    reason=real_auto_stop_reason(ctl,args,balance=ctl.get("current_balance") if ctl else None)
-    if reason and ctl and int(ctl.get("tool_running") or 0):
-        stop_real_tool(conn,reason)
-
-
 def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
     ctl=runtime_control(conn)
     if not ctl or not int(ctl.get("tool_running") or 0) or not int(ctl.get("real_bet_armed") or 0):
@@ -953,26 +930,25 @@ def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
         return "NOT_READY"
     ctl=runtime_control(conn)
     balance=float(ctl.get("current_balance") or 0)
-    reason=real_auto_stop_reason(ctl,args,balance=balance)
-    if reason:
-        stop_real_tool(conn,reason)
-        return reason
     ok,failed=real_gate_check(gate)
     if not ok:
         return "TOP7_GATE_SKIP:"+",".join(failed)
-    ctl=runtime_control(conn)
-    reason=real_auto_stop_reason(ctl,args,balance=balance)
-    if reason:
-        stop_real_tool(conn,reason)
-        return reason
-    pattern=[1,1,2,3]
-    step=max(0,min(int(ctl.get("current_step") or 0),len(pattern)-1))
-    unit=float(pattern[step])
+    step=max(0,min(int(ctl.get("current_step") or 0),len(REAL_BET_MULTIPLIERS)-1))
+    unit=float(REAL_BET_MULTIPLIERS[step])
     stake_per=float(args.real_base_stake)*unit
     total=stake_per*TOP7_COUNT
     if balance<total:
-        stop_real_tool(conn,"INSUFFICIENT_BALANCE",f"balance={balance:.0f}, required={total:.0f}")
+        stop_real_tool(conn,"INSUFFICIENT_BALANCE",
+            f"Không đủ tiền cược 7 số: số dư {money(balance)}đ, cần {money(total)}đ "
+            f"({money(stake_per)}đ/số), thiếu {money(total-balance)}đ.")
         return "INSUFFICIENT_BALANCE"
+    previous_win=None
+    prior=conn.execute("""SELECT issue,status,payout,balance_after_submit FROM real_bets
+        ORDER BY id DESC LIMIT 1""").fetchone()
+    if (prior and prior[1]=="WIN" and prior[2] is not None and prior[3] is not None
+            and str(issue).isdigit() and str(prior[0]).isdigit()
+            and int(issue)-int(prior[0])==1):
+        previous_win=(float(prior[2]),float(prior[3]))
     created=now()
     conn.execute("""INSERT INTO real_bets(issue,step_index,unit_multiplier,selected_numbers_json,stake_per_number,
         total_stake,odds,hit_probability,status,balance_before,created_at)
@@ -985,11 +961,10 @@ def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
             if (not current or not int(current.get("tool_running") or 0)
                     or not int(current.get("real_bet_armed") or 0)):
                 raise RealBetError("Tool đã END/STOP trong lúc chuẩn bị giỏ")
-            if real_auto_stop_reason(current,args,balance=current.get("current_balance")):
-                raise RealBetError("Điều kiện dừng đã kích hoạt trước submit")
             if submit_guard is not None:
                 submit_guard()
-        result=executor.place_top7(str(issue),gate["selected"],stake_per,total,before_submit=before_submit)
+        result=executor.place_top7(str(issue),gate["selected"],stake_per,total,
+                                   before_submit=before_submit,previous_win=previous_win)
         if bool(result.get("dry_run")):
             conn.execute("""UPDATE real_bets SET status='DRY_RUN',balance_after_submit=?,ticket_text=?,error_text=? WHERE issue=?""",
                          (result.get("balance_after"),result.get("ticket_text"),"DRY_RUN: submit không được click",str(issue)))
@@ -1482,17 +1457,18 @@ def main():
     ap.add_argument("--strategy-reset",action="store_true",help="Xóa lịch sử test 3 chiến thuật và reset về vốn ban đầu")
     ap.add_argument("--strategy-bets-csv",default="wingo_strategy_bets.csv")
     ap.add_argument("--strategy-state-csv",default="wingo_strategy_state.csv")
-    # v7.6 real betting: 1-1-2-3 only. Runtime starts STOPPED; dashboard START is required.
+    # Real betting advances after a loss up to 10,000 VND per number; a win resets the stake.
     ap.add_argument("--real-bet-enabled",action=argparse.BooleanOptionalAction,default=True)
     ap.add_argument("--real-resume-after-restart",action=argparse.BooleanOptionalAction,default=False,help="Mặc định false: writer restart/reboot sẽ DISARM real bet")
     ap.add_argument("--real-config",default="88i_realbet_config.json")
     ap.add_argument("--real-profile-dir",default="88i_browser_profile",help="Chỉ dùng khi login.mode=persistent; manual_each_run không cần profile")
-    ap.add_argument("--real-base-stake",type=float,default=3000)
+    ap.add_argument("--real-base-stake",type=float,default=2000)
     ap.add_argument("--real-bet-second",type=int,default=10,help="API countdown second để submit real bet; dashboard có thể override khi START")
-    ap.add_argument("--real-stop-consecutive-losses",type=int,default=5)
-    ap.add_argument("--real-stop-profit-pct",type=float,default=1.0,help="1.0 = +100 phần trăm so với balance lúc START")
-    ap.add_argument("--real-stop-balance-floor-pct",type=float,default=.50,help="0.50 = dừng khi còn 50 phần trăm balance lúc START")
-    ap.add_argument("--real-stop-max-minutes",type=float,default=90)
+    # Legacy flags remain accepted for existing launch scripts; they no longer stop betting.
+    ap.add_argument("--real-stop-consecutive-losses",type=int,default=5,help="Legacy: không còn dùng")
+    ap.add_argument("--real-stop-profit-pct",type=float,default=1.0,help="Legacy: không còn dùng")
+    ap.add_argument("--real-stop-balance-floor-pct",type=float,default=.50,help="Legacy: không còn dùng")
+    ap.add_argument("--real-stop-max-minutes",type=float,default=90,help="Legacy: không còn dùng")
     ap.add_argument("--real-bets-csv",default="wingo_real_bets.csv")
     ap.add_argument("--real-control-csv",default="wingo_real_control.csv")
     ap.add_argument("--once",action="store_true"); args=ap.parse_args()
@@ -1501,11 +1477,13 @@ def main():
         conn.execute("""UPDATE runtime_control SET tool_running=0,real_bet_armed=0,status='STOPPED_RESTART',ended_at=?,
             stop_reason='SERVICE_RESTART_REQUIRES_MANUAL_START',updated_at=? WHERE id=1""",(now(),now())); conn.commit()
     real_executor=RealBetExecutor(args.real_config,args.real_profile_dir) if args.real_bet_enabled else None
-    print("WINGO ADAPTIVE v7.6.3 TOP7 · VISIBLE MANUAL LOGIN · REAL 1-1-2-3 | writer process"); print("API:",API_URL)
+    print("WINGO ADAPTIVE v7.6.3 TOP7 · VISIBLE MANUAL LOGIN · REAL 2-6-8-10 | writer process"); print("API:",API_URL)
     print(f"3 strategy paper test: vốn mô phỏng={money(args.strategy_bankroll)}/strategy | base={money(args.strategy_base_stake)}/số")
     print("Patterns: FLAT=[1] | 1-1-2-3 | 1-3-2-6. WIN đi bước kế tiếp; LOSS reset; hết pattern reset.")
     print("Balanced Gate v7.6: Live/Regime rolling tối đa 80. Paper: FLAT, 1-1-2-3, 1-3-2-6.")
-    print("REAL BET 1-1-2-3: Chromium HIỂN THỊ + login thủ công mỗi lần chạy; prediction second20, real submit default second10; START/END tại dashboard.")
+    print("REAL BET: " + " → ".join(f"{money(args.real_base_stake*x)}/số" for x in REAL_BET_MULTIPLIERS)
+          + "; thua tiếp giữ mức cuối, WIN về mức đầu; chỉ 7 số, không cược Lớn/Nhỏ.")
+    print("Chromium HIỂN THỊ + login thủ công mỗi lần chạy; prediction second20, real submit default second10; START/END tại dashboard.")
     # v7.6.2: login diễn ra TRƯỚC vòng prediction để không đợi tới giây cược mới mở browser.
     # Runtime vẫn STOPPED/DISARMED sau restart; login thành công KHÔNG tự đặt cược.
     if real_executor is not None:

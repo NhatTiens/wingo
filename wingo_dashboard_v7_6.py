@@ -58,10 +58,6 @@ def read_runtime():
     return dict(zip(keys,r)) if r else {}
 
 DEFAULT_REAL_SETTINGS={
-    'stop_consecutive_losses':5,
-    'stop_profit_pct':1.0,
-    'stop_balance_floor_pct':0.50,
-    'stop_max_minutes':90.0,
     'bet_second':10,
 }
 
@@ -70,37 +66,23 @@ def start_tool(settings):
     with db() as c:
         c.execute("""UPDATE runtime_control SET tool_running=1,real_bet_armed=1,status='START_REQUESTED',started_at=?,ended_at=NULL,
             session_start_balance=NULL,current_balance=NULL,session_profit=0,session_bets=0,current_step=0,current_win_streak=0,current_loss_streak=0,longest_loss_streak=0,
-            stop_reason=NULL,last_error=NULL,stop_consecutive_losses=?,stop_profit_pct=?,stop_balance_floor_pct=?,stop_max_minutes=?,bet_second=?,updated_at=? WHERE id=1""",
-            (now(),int(settings['stop_consecutive_losses']),float(settings['stop_profit_pct']),float(settings['stop_balance_floor_pct']),float(settings['stop_max_minutes']),int(settings['bet_second']),now()))
+            stop_reason=NULL,last_error=NULL,stop_consecutive_losses=NULL,stop_profit_pct=NULL,
+            stop_balance_floor_pct=NULL,stop_max_minutes=NULL,bet_second=?,updated_at=? WHERE id=1""",
+            (now(),int(settings['bet_second']),now()))
 
 def end_tool(reason='MANUAL_END',status='STOPPED'):
     ensure_runtime()
     with db() as c:
         c.execute("""UPDATE runtime_control SET tool_running=0,real_bet_armed=0,status=?,ended_at=?,stop_reason=?,updated_at=? WHERE id=1""",(status,now(),reason,now()))
 
-def parse_start_settings(loss_text,profit_text,floor_text,minutes_text,second_text):
+def parse_start_settings(second_text):
     errs=[]
-    def val(txt,default,cast,label,minv=None,maxv=None):
-        t=str(txt or '').strip().replace(',','.')
-        if not t:return default
-        try:v=cast(float(t)) if cast is int else cast(t)
-        except Exception:
-            errs.append(f"{label}: không phải số hợp lệ");return default
-        if minv is not None and v<minv:errs.append(f"{label}: phải ≥ {minv}")
-        if maxv is not None and v>maxv:errs.append(f"{label}: phải ≤ {maxv}")
-        return v
-    loss=val(loss_text,5,int,'LOSS liên tiếp',1,100)
-    profit_pct=val(profit_text,100.0,float,'Mục tiêu lợi nhuận %',0.1,10000)/100.0
-    floor_pct=val(floor_text,50.0,float,'Mức số dư dừng %',0.1,99.9)/100.0
-    minutes=val(minutes_text,90.0,float,'Thời gian tối đa phút',1,100000)
-    sec=val(second_text,10,int,'Giây đặt cược',4,25)
-    return {
-        'stop_consecutive_losses':loss,
-        'stop_profit_pct':profit_pct,
-        'stop_balance_floor_pct':floor_pct,
-        'stop_max_minutes':minutes,
-        'bet_second':sec,
-    },errs
+    try:
+        sec=int(str(second_text).strip()) if str(second_text).strip() else 10
+    except ValueError:
+        return {'bet_second':10},['Giây đặt cược: không phải số nguyên hợp lệ']
+    if not 4<=sec<=25: errs.append('Giây đặt cược: phải từ 4 đến 25')
+    return {'bet_second':sec},errs
 
 def config_status():
     cfg_exists = REALCFG.exists()
@@ -134,7 +116,7 @@ def config_status():
     }
 
 st.title("🎯 Wingo Adaptive v7.6.3 · VISIBLE REAL BET CONTROL")
-st.caption("TOP7 · Real 1-1-2-3 · Chromium hiển thị · login thủ công mỗi lần chạy · configurable STOP · START/END")
+st.caption("TOP7 · Real: 2.000 → 6.000 → 8.000 → 10.000đ/số · Chromium hiển thị · login thủ công mỗi lần chạy · START/END")
 ensure_runtime()
 ctl=read_runtime()
 _cfg=config_status()
@@ -151,7 +133,7 @@ cc=st.columns([1.2,1.2,1.2,1,1,1,1])
 cc[0].metric("Tool",str(ctl.get('status','STOPPED')))
 cc[1].metric("Real Bet","ARMED" if int(ctl.get('real_bet_armed') or 0) else "DISARMED")
 cc[2].metric("Số dư web",money(ctl.get('current_balance')))
-cc[3].metric("Step",f"{int(ctl.get('current_step') or 0)+1}/4")
+cc[3].metric("Step",f"{min(max(int(ctl.get('current_step') or 0),0),3)+1}/4")
 cc[4].metric("Session P/L",money(ctl.get('session_profit')))
 cc[5].metric("Real bets",int(ctl.get('session_bets') or 0))
 cc[6].metric("Loss streak",f"{int(ctl.get('current_loss_streak') or 0)}/{int(ctl.get('longest_loss_streak') or 0)}")
@@ -177,22 +159,13 @@ if login_mode == "manual_each_run":
     st.info("Mỗi lần chạy WRITER sẽ mở Chromium sạch và chờ bạn đăng nhập trực tiếp trên 88i. Sau LOGIN OK, dashboard sẽ hiện số dư và trạng thái STOPPED_READY; bạn vẫn phải bấm START.")
 else:
     st.caption(f"Profile: {PROFILE}")
-st.markdown("#### ⚙️ Điều kiện phiên (để trống = dùng mặc định)")
-sc=st.columns(5)
-loss_txt=sc[0].text_input("Dừng sau LOSS liên tiếp",value="",placeholder="Mặc định 5")
-profit_txt=sc[1].text_input("Dừng khi lợi nhuận đạt (%)",value="",placeholder="Mặc định 100")
-floor_txt=sc[2].text_input("Dừng khi số dư còn (%)",value="",placeholder="Mặc định 50")
-minutes_txt=sc[3].text_input("Thời gian tối đa (phút)",value="",placeholder="Mặc định 90")
-second_txt=sc[4].text_input("Đặt cược ở countdown giây",value="",placeholder="Mặc định 10")
-start_settings,start_errors=parse_start_settings(loss_txt,profit_txt,floor_txt,minutes_txt,second_txt)
+st.markdown("#### ⚙️ Thời điểm đặt cược")
+second_txt=st.text_input("Đặt cược ở countdown giây",value="",placeholder="Mặc định 10")
+start_settings,start_errors=parse_start_settings(second_txt)
 if start_errors:
     st.error(" · ".join(start_errors))
-st.caption(
-    f"Sẽ dùng: {start_settings['stop_consecutive_losses']} LOSS · lợi nhuận +{start_settings['stop_profit_pct']*100:.0f}% "
-    f"· số dư ≤ {start_settings['stop_balance_floor_pct']*100:.0f}% vốn lúc START · {start_settings['stop_max_minutes']:.0f} phút "
-    f"· submit tại countdown second {start_settings['bet_second']}."
-)
-confirm=st.checkbox("Tôi xác nhận START sẽ cho phép chiến thuật 1-1-2-3 đặt cược thật khi config dry_run=false và TOP7 Gate PASS.")
+st.caption(f"Submit tại countdown second {start_settings['bet_second']}. Cược thật chỉ dừng vì thiếu tiền cho 7 số hoặc lỗi vận hành không thể xác nhận lệnh; END/EMERGENCY STOP vẫn hoạt động.")
+confirm=st.checkbox("Tôi xác nhận START sẽ cho phép cược thật 7 số với mức 2.000 → 6.000 → 8.000 → 10.000đ/số khi config dry_run=false và TOP7 Gate PASS.")
 
 start_blockers=[]
 if not confirm: start_blockers.append("chưa tick xác nhận")
@@ -200,7 +173,7 @@ if not cfg_file_ok: start_blockers.append("thiếu config")
 elif not cfg_enabled: start_blockers.append("enabled=false")
 if login_mode == "manual_each_run" and cfg_headless: start_blockers.append("manual login nhưng headless=true")
 if profile_required and not profile_ok: start_blockers.append("thiếu 88i_browser_profile")
-if start_errors: start_blockers.append("input STOP không hợp lệ")
+if start_errors: start_blockers.append("giây đặt cược không hợp lệ")
 
 if start_blockers:
     st.caption("START đang khóa vì: " + " · ".join(start_blockers))
@@ -209,7 +182,7 @@ else:
 
 b1,b2,b3=st.columns(3)
 if b1.button("▶ START TOOL",type="primary",use_container_width=True,disabled=bool(start_blockers)):
-    start_tool(start_settings); st.success("Đã gửi START với các điều kiện vừa nhập. Writer sẽ đọc số dư ban đầu và chốt mốc dừng."); st.rerun()
+    start_tool(start_settings); st.success("Đã gửi START. Writer sẽ đọc số dư và đặt cược theo quy tắc mới khi TOP7 Gate PASS."); st.rerun()
 if b2.button("■ END TOOL",use_container_width=True):
     end_tool('MANUAL_END','STOPPED'); st.warning("Đã END: không tạo lệnh mới. Lệnh đã submit trước đó vẫn được theo dõi."); st.rerun()
 if b3.button("⛔ EMERGENCY STOP",use_container_width=True):
@@ -230,7 +203,7 @@ def render():
     c[0].metric("Tổng kỳ",len(res));c[1].metric("Kỳ",latest["issue"]);c[2].metric("Số",int(latest["number"]));c[3].metric("KQ",latest.get("size","-"))
     c[4].metric("Regime",stt["regime_label"] if stt is not None else "-");c[5].metric("Health",stt["data_health"] if stt is not None else "-")
     c[6].metric("Drift",num(stt["drift_score"]) if stt is not None else "-");c[7].metric("ECE",num(stt["calibration_ece"]) if stt is not None else "-")
-    tabs=st.tabs(["🧠 Prediction","7️⃣ TOP7","💵 REAL 1-1-2-3","🧭 Regime","🎯 Calibration","⚖️ Models","🩺 Data Health","💰 Paper","📊 History"])
+    tabs=st.tabs(["🧠 Prediction","7️⃣ TOP7","💵 REAL","🧭 Regime","🎯 Calibration","⚖️ Models","🩺 Data Health","💰 Paper","📊 History"])
     with tabs[0]:
         if pred is None or pred.empty:st.info("Chưa có predictions")
         else:
@@ -379,23 +352,23 @@ Live/Regime luôn dùng tối đa 80 mẫu gần nhất: mẫu mới vào thì m
             cols=[c for c in ["issue","strategy","step_index","unit_multiplier","selected_numbers_json","stake_per_number","total_stake","status","actual_number","profit","bankroll_after","created_at","resolved_at"] if c in stratbets.columns]
             st.dataframe(stratbets.tail(120)[cols].sort_index(ascending=False),use_container_width=True,hide_index=True)
     with tabs[2]:
-        st.subheader("💵 REAL BET · chiến thuật 1-1-2-3")
-        st.caption("Step: 1→1→2→3. WIN đi bước tiếp theo; LOSS reset step 1; thắng step 4 cũng reset step 1. SKIP không đổi step.")
+        st.subheader("💵 REAL BET · tăng mức sau mỗi tay thua")
+        st.caption("2.000 → 6.000 → 8.000 → 10.000đ/số; thua tiếp giữ mức 10.000đ/số. Thắng trở về 2.000đ/số; TOP7 Gate SKIP giữ nguyên mức.")
         ctl2=read_runtime()
-        pattern=[1,1,2,3]; step=max(0,min(int(ctl2.get('current_step') or 0),3)); unit=pattern[step]
+        pattern=[1,3,4,5]; step=max(0,min(int(ctl2.get('current_step') or 0),3)); unit=pattern[step]
         rc=st.columns(6)
         rc[0].metric("Status",str(ctl2.get('status','STOPPED')))
         rc[1].metric("Current step",f"{step+1}/4",f"x{unit}")
-        rc[2].metric("Mặc định / số",money(3000*unit))
-        rc[3].metric("Tổng 7 số",money(3000*unit*7))
+        rc[2].metric("Mặc định / số",money(2000*unit))
+        rc[3].metric("Tổng 7 số",money(2000*unit*7))
         rc[4].metric("Session P/L",money(ctl2.get('session_profit')))
         rc[5].metric("Balance",money(ctl2.get('current_balance')))
-        loss_lim=int(ctl2.get('stop_consecutive_losses') or DEFAULT_REAL_SETTINGS['stop_consecutive_losses'])
-        prof=float(ctl2.get('stop_profit_pct') if ctl2.get('stop_profit_pct') is not None else DEFAULT_REAL_SETTINGS['stop_profit_pct'])*100
-        floor=float(ctl2.get('stop_balance_floor_pct') if ctl2.get('stop_balance_floor_pct') is not None else DEFAULT_REAL_SETTINGS['stop_balance_floor_pct'])*100
-        mins=float(ctl2.get('stop_max_minutes') if ctl2.get('stop_max_minutes') is not None else DEFAULT_REAL_SETTINGS['stop_max_minutes'])
         bsec=int(ctl2.get('bet_second') or DEFAULT_REAL_SETTINGS['bet_second'])
-        st.markdown(f"**STOP đang dùng:** {loss_lim} LOSS liên tiếp · balance đạt +{prof:.0f}% so với lúc START · balance giảm còn {floor:.0f}% vốn lúc START · {mins:.0f} phút · lỗi login/balance/0-9/selector/tổng tiền/xác nhận → STOP.")
+        st.markdown("**Tự dừng:** thiếu tiền cho đủ 7 số. Lỗi login, số dư, chọn số, tổng tiền hoặc xác nhận lệnh cũng dừng để tránh gửi lệnh không kiểm soát.")
+        if ctl2.get('stop_reason') == 'INSUFFICIENT_BALANCE':
+            st.error(f"Tool đã dừng vì không đủ tiền cược. {ctl2.get('last_error') or ''}")
+        elif ctl2.get('stop_reason') and str(ctl2.get('status','')).startswith(('AUTO_STOPPED','ERROR')):
+            st.error(f"Tool đã dừng: {ctl2['stop_reason']}. {ctl2.get('last_error') or ''}")
         st.caption(f"Prediction chạy sớm; real submit được lên lịch tại countdown second {bsec}. Không có giới hạn số lệnh.")
         st.markdown("**Cược thật dùng đúng TOP7 Gate:** Health=OK · Calibrated ≥72% · Consensus ≥55% · Stability ≥75% · Drift ≤0,45 · Live hit ≥72% khi đủ 80 mẫu · Regime hit ≥72% khi đủ 50 mẫu.")
         if realbets is None or realbets.empty:
@@ -404,11 +377,18 @@ Live/Regime luôn dùng tối đa 80 mẫu gần nhất: mẫu mới vào thì m
             rb=realbets.copy()
             for col in ['stake_per_number','total_stake','payout','profit','balance_before','balance_after_submit']:
                 if col in rb: rb[col]=pd.to_numeric(rb[col],errors='coerce')
+            def draw_hit(row):
+                try:
+                    if pd.isna(row['actual_number']):return None
+                    return 'Trúng' if int(row['actual_number']) in json.loads(row['selected_numbers_json']) else 'Trượt'
+                except (KeyError,TypeError,ValueError):return None
+            rb['draw_hit']=rb.apply(draw_hit,axis=1)
+            st.caption("Trúng/Trượt so theo số mở thưởng và 7 số đã chọn. Với lệnh UNKNOWN, đây chỉ là kết quả của dãy số; cần lịch sử 88i để xác nhận tiền cược đã được nhận.")
             settled=rb[rb['status'].isin(['WIN','LOSS'])].copy() if 'status' in rb else rb.iloc[0:0]
             if len(settled):
                 wins=int((settled['status']=='WIN').sum()); losses=int((settled['status']=='LOSS').sum()); pl=settled['profit'].fillna(0).sum(); ts=settled['total_stake'].fillna(0).sum()
                 m=st.columns(4);m[0].metric('Settled',len(settled));m[1].metric('WIN/LOSS',f"{wins}/{losses}");m[2].metric('Hit',f"{wins/len(settled)*100:.2f}%");m[3].metric('P/L',money(pl),f"ROI {pl/ts*100:.2f}%" if ts else '-')
-            cols=[c for c in ['issue','step_index','unit_multiplier','selected_numbers_json','stake_per_number','total_stake','status','actual_number','profit','balance_before','balance_after_submit','ticket_text','error_text','created_at','resolved_at'] if c in rb.columns]
+            cols=[c for c in ['issue','step_index','unit_multiplier','selected_numbers_json','stake_per_number','total_stake','status','actual_number','draw_hit','profit','balance_before','balance_after_submit','ticket_text','error_text','created_at','resolved_at'] if c in rb.columns]
             st.dataframe(rb.tail(100)[cols].sort_index(ascending=False),use_container_width=True,hide_index=True)
     with tabs[3]:
         if stt is None:st.info("Chưa có system state")

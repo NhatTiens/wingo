@@ -1,0 +1,252 @@
+diff --git a/README.md b/README.md
+index f1d5913..0bff1cf 100644
+--- a/README.md
++++ b/README.md
+@@ -13,10 +13,18 @@ Chỉ mức cược thật đổi; các chiến thuật thử nghiệm trên gi
+ 
+ ## Xác nhận cược và lệnh UNKNOWN
+ 
++WIN/LOSS của lệnh đã được website xác nhận dựa trực tiếp vào số mở thưởng:
++số ra nằm trong 7 số đã chọn là WIN, còn lại là LOSS. Việc chốt kết quả
++không chờ số dư tăng do trả thưởng và không tự cộng tiền thưởng dự kiến vào
++số dư hiển thị. Số dư chỉ được dùng ở bước riêng để xác nhận website nhận
++lệnh cược và kiểm tra đủ tiền trước khi cược.
++
+ Sau khi bấm đặt cược, writer đọc số dư trực tiếp trên trang hiện tại tối đa 12 giây.
+ Nếu số dư chưa cập nhật sau 5 giây, writer tải lại trang đúng một lần, không gửi thêm lệnh.
+ Chỉ khi số dư giảm đúng tổng tiền TOP7, lệnh mới được xác nhận `OPEN`.
+ Nếu vẫn không xác nhận được thì lệnh là `UNKNOWN` và writer dừng để tránh cược trùng.
++Dãy số của lệnh UNKNOWN vẫn được đối chiếu với số mở thưởng và hiển thị
++Trúng/Trượt; đó chưa phải tiền thắng/thua thực nếu 88i chưa xác nhận đơn cược.
+ Danh sách “Đặt cược thành công” trên website có thể gồm lệnh cũ nên không được dùng
+ một mình để tự động gỡ `UNKNOWN` cho một kỳ cược cụ thể.
+ 
+@@ -36,6 +44,25 @@ python .\reconcile_real_bet.py --issue 202609252574 --mark-placed --expected-num
+ 
+ Sau đó chạy lại writer, đăng nhập và bấm START TOOL. Không xóa DB để gỡ UNKNOWN.
+ 
++Với kỳ `202609252643` trong ảnh mới, dừng writer rồi xem DB:
++
++```powershell
++python .\reconcile_real_bet.py --issue 202609252643
++```
++
++Nếu lịch sử 88i xác nhận đã nhận đúng kỳ này, 7 số `0,4,3,6,5,9,1`
++và tổng `14000`, dùng:
++
++```powershell
++python .\reconcile_real_bet.py --issue 202609252643 --mark-placed --expected-numbers 0,4,3,6,5,9,1 --expected-total 14000
++```
++
++Nếu lịch sử 88i xác nhận không nhận lệnh đó, dùng lệnh dưới đây thay thế:
++
++```powershell
++python .\reconcile_real_bet.py --issue 202609252643 --mark-not-placed --expected-numbers 0,4,3,6,5,9,1 --expected-total 14000
++```
++
+ Sửa UX của v7.6.2:
+ - Sau khi login thành công, xóa `last_error` cũ.
+ - Ghi ngay `current_balance` lên dashboard.
+diff --git a/reconcile_real_bet.py b/reconcile_real_bet.py
+index 5b6f4e5..86c1c96 100644
+--- a/reconcile_real_bet.py
++++ b/reconcile_real_bet.py
+@@ -1,16 +1,18 @@
+ """Reconcile one UNKNOWN real bet after checking that exact order on 88i.
+ 
+-Read-only unless --mark-placed is supplied. Run with the writer stopped.
++Read-only unless --mark-placed or --mark-not-placed is supplied. Run with the writer stopped.
+ """
+ import argparse
+ import json
+ import sqlite3
+ from contextlib import closing
++from datetime import datetime, timezone
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
+ 
+-def reconcile(db, issue, mark_placed=False, expected_numbers=None, expected_total=None):
++def reconcile(db, issue, mark_placed=False, expected_numbers=None, expected_total=None,
++              mark_not_placed=False):
+     path = Path(db)
+     if not path.is_file():
+         raise ValueError(f"Không tìm thấy DB: {path}")
+@@ -24,7 +26,14 @@ def reconcile(db, issue, mark_placed=False, expected_numbers=None, expected_tota
+         numbers = json.loads(row[0])
+         print(f"Issue: {issue} | số: {numbers} | cược mỗi số: {row[1]:,.0f} | "
+               f"tổng: {row[2]:,.0f} | trạng thái: {row[3]} | số dư trước: {row[4]}")
+-        if not mark_placed:
++        draw = conn.execute("SELECT number FROM results WHERE issue=?", (str(issue),)).fetchone()
++        if draw:
++            print(f"Số mở thưởng: {draw[0]} | dãy số: {'Trúng' if int(draw[0]) in numbers else 'Trượt'}")
++        if row[5]:
++            print(f"Lỗi xác nhận lệnh: {row[5]}")
++        if mark_placed and mark_not_placed:
++            raise ValueError("Chỉ được chọn một cách đối soát")
++        if not mark_placed and not mark_not_placed:
+             return row[3]
+ 
+         if expected_numbers is None or expected_total is None:
+@@ -44,6 +53,18 @@ def reconcile(db, issue, mark_placed=False, expected_numbers=None, expected_tota
+         with closing(sqlite3.connect(backup_path)) as backup:
+             conn.backup(backup)
+         conn.execute("BEGIN IMMEDIATE")
++        if mark_not_placed:
++            updated = conn.execute(
++                "UPDATE real_bets SET status='NOT_PLACED',resolved_at=?,"
++                "error_text=COALESCE(error_text,'') || ' | MANUALLY_VERIFIED_NOT_PLACED_88I' "
++                "WHERE issue=? AND status='UNKNOWN'",
++                (datetime.now(timezone.utc).isoformat(timespec="seconds"), str(issue)),
++            )
++            if updated.rowcount != 1:
++                raise ValueError("Trạng thái lệnh đã thay đổi; chưa cập nhật")
++            conn.commit()
++            print(f"Đã đối soát: NOT_PLACED | backup: {backup_path}")
++            return "NOT_PLACED"
+         updated = conn.execute(
+             "UPDATE real_bets SET status='OPEN',ticket_text=?,error_text=NULL "
+             "WHERE issue=? AND status='UNKNOWN'",
+@@ -74,12 +95,14 @@ def main():
+     ap.add_argument("--issue", required=True)
+     ap.add_argument("--mark-placed", action="store_true",
+                     help="Chỉ dùng sau khi xác nhận đúng issue, 7 số và tổng cược ở lịch sử 88i")
++    ap.add_argument("--mark-not-placed", action="store_true",
++                    help="Chỉ dùng sau khi xác nhận 88i KHÔNG nhận lệnh đúng issue, 7 số và tổng cược")
+     ap.add_argument("--expected-numbers", help="Bảy số đúng thứ tự trong DB, ví dụ 4,9,8,7,6,1,3")
+     ap.add_argument("--expected-total", type=float)
+     a = ap.parse_args()
+     try:
+         expected_numbers = [int(s) for s in a.expected_numbers.split(",")] if a.expected_numbers else None
+-        reconcile(a.db, a.issue, a.mark_placed, expected_numbers, a.expected_total)
++        reconcile(a.db, a.issue, a.mark_placed, expected_numbers, a.expected_total, a.mark_not_placed)
+     except (ValueError, sqlite3.Error) as exc:
+         ap.exit(2, f"Không đối soát: {exc}\n")
+ 
+diff --git a/test_realbet.py b/test_realbet.py
+index 0f93946..7c2fdfe 100644
+--- a/test_realbet.py
++++ b/test_realbet.py
+@@ -79,6 +79,26 @@ class RealWorkflowTests(unittest.TestCase):
+         self.assertEqual(len(executor.calls), 2)
+         self.assertEqual(executor.calls[-1][2:], (2000.0, 14000.0))
+ 
++    def test_win_uses_drawn_number_without_waiting_for_payout(self):
++        executor = FakeExecutor(balance=220265)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "642", gate(), self.a, executor), "PLACED")
++        self.assertEqual(app.runtime_control(self.conn)["current_balance"], 206265)
++        app.settle_real_bet(self.conn, "642", 3, self.a)
++        row = self.conn.execute("SELECT status,actual_number,payout,profit FROM real_bets WHERE issue='642'").fetchone()
++        self.assertEqual(row, ("WIN", 3, 19790, 5790))
++        self.assertEqual(app.runtime_control(self.conn)["current_balance"], 206265)
++
++    def test_unknown_records_draw_without_counting_unverified_winnings(self):
++        self.conn.execute("""INSERT INTO real_bets(issue,step_index,unit_multiplier,selected_numbers_json,
++            stake_per_number,total_stake,odds,status,created_at)
++            VALUES('643',0,1,'[0, 4, 3, 6, 5, 9, 1]',2000,14000,9.895,'UNKNOWN','now')""")
++        self.conn.commit()
++        app.settle_real_bet(self.conn, "643", 4, self.a)
++        self.assertEqual(self.conn.execute("SELECT status,actual_number,profit FROM real_bets WHERE issue='643'").fetchone(),
++                         ("UNKNOWN", 4, None))
++        self.assertEqual(app.runtime_control(self.conn)["session_bets"], 0)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "644", gate(), self.a, FakeExecutor()), "WAIT_OPEN_BET")
++
+     def test_three_losses_multiply_by_four_then_fourth_bet_resets(self):
+         executor = FakeExecutor()
+         for issue, stake, total, next_step in [
+@@ -190,6 +210,28 @@ class RealWorkflowTests(unittest.TestCase):
+ 
+ 
+ class ReconciliationTests(unittest.TestCase):
++    def test_verified_missing_order_can_be_closed_without_creating_a_bet(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            db = Path(tmp) / "test.db"
++            conn = app.init_db(db, 525000, 3000)
++            try:
++                conn.execute("INSERT INTO real_bets(issue,step_index,unit_multiplier,selected_numbers_json,"
++                             "stake_per_number,total_stake,odds,status,created_at) "
++                             "VALUES('643',0,1,'[0, 4, 3, 6, 5, 9, 1]',2000,14000,9.895,'UNKNOWN','now')")
++                conn.commit()
++                with self.assertRaisesRegex(ValueError, "Tổng cược"):
++                    reconcile(db, "643", expected_numbers=[0, 4, 3, 6, 5, 9, 1],
++                              expected_total=21000, mark_not_placed=True)
++                self.assertEqual(reconcile(db, "643", expected_numbers=[0, 4, 3, 6, 5, 9, 1],
++                                           expected_total=14000, mark_not_placed=True), "NOT_PLACED")
++                self.assertEqual(conn.execute("SELECT status FROM real_bets WHERE issue='643'").fetchone()[0], "NOT_PLACED")
++                self.assertEqual(app.runtime_control(conn)["session_bets"], 0)
++                conn.execute("UPDATE runtime_control SET tool_running=1,real_bet_armed=1 WHERE id=1")
++                conn.commit()
++                self.assertEqual(app.maybe_place_real_bet(conn, "644", gate(), args(), FakeExecutor()), "PLACED")
++            finally:
++                conn.close()
++
+     def test_confirmed_unknown_settles_once_and_preserves_backup(self):
+         with tempfile.TemporaryDirectory() as tmp:
+             db = Path(tmp) / "test.db"
+diff --git a/wingo_dashboard_v7_6.py b/wingo_dashboard_v7_6.py
+index afe7273..b1c7ff5 100644
+--- a/wingo_dashboard_v7_6.py
++++ b/wingo_dashboard_v7_6.py
+@@ -404,11 +404,18 @@ Live/Regime luôn dùng tối đa 80 mẫu gần nhất: mẫu mới vào thì m
+             rb=realbets.copy()
+             for col in ['stake_per_number','total_stake','payout','profit','balance_before','balance_after_submit']:
+                 if col in rb: rb[col]=pd.to_numeric(rb[col],errors='coerce')
++            def draw_hit(row):
++                try:
++                    if pd.isna(row['actual_number']):return None
++                    return 'Trúng' if int(row['actual_number']) in json.loads(row['selected_numbers_json']) else 'Trượt'
++                except (KeyError,TypeError,ValueError):return None
++            rb['draw_hit']=rb.apply(draw_hit,axis=1)
++            st.caption("Trúng/Trượt so theo số mở thưởng và 7 số đã chọn. Với lệnh UNKNOWN, đây chỉ là kết quả của dãy số; cần lịch sử 88i để xác nhận tiền cược đã được nhận.")
+             settled=rb[rb['status'].isin(['WIN','LOSS'])].copy() if 'status' in rb else rb.iloc[0:0]
+             if len(settled):
+                 wins=int((settled['status']=='WIN').sum()); losses=int((settled['status']=='LOSS').sum()); pl=settled['profit'].fillna(0).sum(); ts=settled['total_stake'].fillna(0).sum()
+                 m=st.columns(4);m[0].metric('Settled',len(settled));m[1].metric('WIN/LOSS',f"{wins}/{losses}");m[2].metric('Hit',f"{wins/len(settled)*100:.2f}%");m[3].metric('P/L',money(pl),f"ROI {pl/ts*100:.2f}%" if ts else '-')
+-            cols=[c for c in ['issue','step_index','unit_multiplier','selected_numbers_json','stake_per_number','total_stake','status','actual_number','profit','balance_before','balance_after_submit','ticket_text','error_text','created_at','resolved_at'] if c in rb.columns]
++            cols=[c for c in ['issue','step_index','unit_multiplier','selected_numbers_json','stake_per_number','total_stake','status','actual_number','draw_hit','profit','balance_before','balance_after_submit','ticket_text','error_text','created_at','resolved_at'] if c in rb.columns]
+             st.dataframe(rb.tail(100)[cols].sort_index(ascending=False),use_container_width=True,hide_index=True)
+     with tabs[3]:
+         if stt is None:st.info("Chưa có system state")
+diff --git a/wingo_id77_adaptive_v7_6.py b/wingo_id77_adaptive_v7_6.py
+index f515315..6dbf325 100644
+--- a/wingo_id77_adaptive_v7_6.py
++++ b/wingo_id77_adaptive_v7_6.py
+@@ -907,7 +907,15 @@ def real_auto_stop_reason(ctl,args,balance=None):
+ def settle_real_bet(conn,issue,n,args):
+     row=conn.execute("""SELECT id,step_index,selected_numbers_json,stake_per_number,total_stake,odds,status
+         FROM real_bets WHERE issue=? AND status='OPEN'""",(issue,)).fetchone()
+-    if not row:return
++    if not row:
++        # A draw can be recorded even if the website never confirmed the order.
++        # Keep UNKNOWN so an unverified order is never counted as a real win.
++        if conn.execute("""SELECT 1 FROM real_bets WHERE issue=? AND status='UNKNOWN'
++            AND actual_number IS NULL""",(str(issue),)).fetchone():
++            conn.execute("""UPDATE real_bets SET actual_number=?,resolved_at=?
++                WHERE issue=? AND status='UNKNOWN' AND actual_number IS NULL""",(int(n),now(),str(issue)))
++            conn.commit()
++        return
+     bid,step,js,stake_per,total,odds,status=row
+     try:selected=[int(x) for x in json.loads(js)]
+     except Exception:selected=[]
+@@ -927,18 +935,14 @@ def settle_real_bet(conn,issue,n,args):
+         next_step=(int(step)+1)%len(REAL_BET_MULTIPLIERS)
+         cws=0; cls+=1; lls=max(lls,cls)
+ 
+-    # balance_after_submit đã trừ stake. Khi kỳ resolve, website cộng payout nếu WIN.
+-    curbal=ctl.get("current_balance")
+-    expected_balance=(float(curbal)+payout) if curbal is not None else None
+-
+     conn.execute("""UPDATE real_bets SET status=?,actual_number=?,payout=?,profit=?,resolved_at=? WHERE id=?""",
+                  ("WIN" if won else "LOSS",int(n),payout,profit,now(),bid))
+     conn.execute("""UPDATE runtime_control SET session_profit=?,session_bets=?,current_step=?,
+-        current_win_streak=?,current_loss_streak=?,longest_loss_streak=?,current_balance=COALESCE(?,current_balance),updated_at=? WHERE id=1""",
+-                 (spl,bets,next_step,cws,cls,lls,expected_balance,now()))
++        current_win_streak=?,current_loss_streak=?,longest_loss_streak=?,updated_at=? WHERE id=1""",
++                 (spl,bets,next_step,cws,cls,lls,now()))
+     conn.commit()
+     ctl=runtime_control(conn)
+-    reason=real_auto_stop_reason(ctl,args,balance=ctl.get("current_balance") if ctl else None)
++    reason=real_auto_stop_reason(ctl,args,balance=None)
+     if reason and ctl and int(ctl.get("tool_running") or 0):
+         stop_real_tool(conn,reason)
+ 

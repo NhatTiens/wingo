@@ -32,7 +32,8 @@
   },
   "success": {
     "mode": "balance_decrease",
-    "timeout_ms": 6000,
+    "timeout_ms": 12000,
+    "refresh_after_ms": 5000,
     "balance_tolerance": 2
   },
   "ui_recovery": {

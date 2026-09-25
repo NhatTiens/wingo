@@ -1,0 +1,285 @@
+--- a/wingo_realbet.py
++++ b/wingo_realbet.py
+@@ -10,9 +10,11 @@
+ 
+ 
+ class RealBetError(RuntimeError):
+-    def __init__(self, message: str, *, may_have_submitted: bool = False):
++    def __init__(self, message: str, *, may_have_submitted: bool = False,
++                 continue_as_loss: bool = False):
+         super().__init__(message)
+         self.may_have_submitted = bool(may_have_submitted)
++        self.continue_as_loss = bool(may_have_submitted and continue_as_loss)
+ 
+ 
+ def parse_money(text: str) -> float:
+@@ -47,7 +49,7 @@
+     - Không render đủ 0..9 -> reload tối đa N lần, vẫn thiếu -> STOP.
+     - Không đúng 7 input stake / tổng tiền -> STOP trước submit.
+     - dry_run=true -> tuyệt đối không click submit.
+-    - Sau submit thật, mặc định xác nhận bằng biến động số dư; nếu không xác nhận được -> UNKNOWN + STOP.
++    - Không xác nhận được biến động số dư -> UNKNOWN, tăng bước như thua; lỗi trang vẫn STOP.
+     """
+ 
+     def __init__(self, config_path: str | Path, profile_dir: str | Path):
+@@ -537,8 +539,9 @@
+                 f"số dư cuối={observed}, cần giảm={expected_total:.0f}, "
+                 f"đã refresh={refreshed}, không đọc được={missing_balance} lần, "
+                 f"lỗi refresh={refresh_error or 'không'}. "
+-                "Kiểm tra lịch sử cược trên 88i trước khi START lại.",
++                "Kiểm tra lịch sử cược trên 88i để đối soát lệnh chưa xác nhận.",
+                 may_have_submitted=True,
++                continue_as_loss=True,
+             )
+ 
+         result["ok"] = True
+--- a/wingo_id77_adaptive_v7_6.py
++++ b/wingo_id77_adaptive_v7_6.py
+@@ -918,13 +918,31 @@
+         current_win_streak=?,current_loss_streak=?,longest_loss_streak=?,updated_at=? WHERE id=1""",
+                  (spl,bets,next_step,cws,cls,lls,now()))
+     conn.commit()
++
++
++def assume_unknown_loss_for_progression(conn,issue,step,reason):
++    """Advance only the next stake; keep the order and money outcome UNKNOWN."""
++    note="ASSUMED_LOSS_FOR_PROGRESSION_ONLY"
++    message=str(reason)
++    if note not in message:
++        message=f"{message} | {note}"
++    conn.execute("UPDATE real_bets SET status='UNKNOWN',error_text=? WHERE issue=?",
++                 (message,str(issue)))
++    ctl=runtime_control(conn)
++    if ctl and int(ctl.get("tool_running") or 0) and int(ctl.get("real_bet_armed") or 0):
++        next_step=min(int(step)+1,len(REAL_BET_MULTIPLIERS)-1)
++        conn.execute("UPDATE runtime_control SET current_step=?,current_win_streak=0,updated_at=? WHERE id=1",
++                     (next_step,now()))
++    conn.commit()
++
++
+ def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
+     ctl=runtime_control(conn)
+     if not ctl or not int(ctl.get("tool_running") or 0) or not int(ctl.get("real_bet_armed") or 0):
+         return "STOPPED"
+     if conn.execute("SELECT 1 FROM real_bets WHERE issue=?",(issue,)).fetchone():
+         return "EXISTS"
+-    if conn.execute("SELECT 1 FROM real_bets WHERE status IN ('OPEN','UNKNOWN') LIMIT 1").fetchone():
++    if conn.execute("SELECT 1 FROM real_bets WHERE status='OPEN' LIMIT 1").fetchone():
+         return "WAIT_OPEN_BET"
+     if not ensure_real_session(conn,args,executor):
+         return "NOT_READY"
+@@ -972,9 +990,8 @@
+             stop_real_tool(conn,"DRY_RUN_COMPLETE","Config vẫn dry_run=true; chưa đặt tiền thật.",status="STOPPED")
+             return "DRY_RUN"
+         if not result.get("ok") or not result.get("confirmed"):
+-            conn.execute("UPDATE real_bets SET status='UNKNOWN',error_text=? WHERE issue=?",("Submission not confirmed",str(issue)))
+-            conn.commit(); stop_real_tool(conn,"UNKNOWN_SUBMISSION","Không xác nhận được ticket",status="ERROR")
+-            return "UNKNOWN"
++            assume_unknown_loss_for_progression(conn,issue,step,"Submission not confirmed")
++            return "UNKNOWN_ASSUMED_LOSS"
+         conn.execute("""UPDATE real_bets SET status='OPEN',balance_after_submit=?,ticket_text=?,error_text=NULL WHERE issue=?""",
+                      (result.get("balance_after"),result.get("ticket_text"),str(issue)))
+         if result.get("balance_after") is not None:
+@@ -982,6 +999,9 @@
+         conn.commit()
+         return "PLACED"
+     except RealBetError as exc:
++        if exc.continue_as_loss:
++            assume_unknown_loss_for_progression(conn,issue,step,exc)
++            return "UNKNOWN_ASSUMED_LOSS"
+         status="UNKNOWN" if exc.may_have_submitted else "ERROR"
+         conn.execute("UPDATE real_bets SET status=?,error_text=? WHERE issue=?",(status,str(exc),str(issue)));conn.commit()
+         stop_real_tool(conn,"REAL_BET_EXECUTOR_ERROR",exc,status="ERROR")
+--- a/wingo_dashboard_v7_6.py
++++ b/wingo_dashboard_v7_6.py
+@@ -64,11 +64,22 @@
+ def start_tool(settings):
+     ensure_runtime()
+     with db() as c:
++        step=0
++        has_real_bets=c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='real_bets'").fetchone()
++        latest=c.execute("SELECT id,step_index,status,error_text FROM real_bets ORDER BY id DESC LIMIT 1").fetchone() if has_real_bets else None
++        if latest and latest[2]=='UNKNOWN':
++            # Reuse the recorded step, including an UNKNOWN from before this update.
++            step=min(max(int(latest[1]),0)+1,3)
++            note='ASSUMED_LOSS_FOR_PROGRESSION_ONLY'
++            message=str(latest[3] or '')
++            if note not in message:
++                c.execute("UPDATE real_bets SET error_text=? WHERE id=?",
++                          (f"{message} | {note}".strip(' |'),latest[0]))
+         c.execute("""UPDATE runtime_control SET tool_running=1,real_bet_armed=1,status='START_REQUESTED',started_at=?,ended_at=NULL,
+-            session_start_balance=NULL,current_balance=NULL,session_profit=0,session_bets=0,current_step=0,current_win_streak=0,current_loss_streak=0,longest_loss_streak=0,
++            session_start_balance=NULL,current_balance=NULL,session_profit=0,session_bets=0,current_step=?,current_win_streak=0,current_loss_streak=0,longest_loss_streak=0,
+             stop_reason=NULL,last_error=NULL,stop_consecutive_losses=NULL,stop_profit_pct=NULL,
+             stop_balance_floor_pct=NULL,stop_max_minutes=NULL,bet_second=?,updated_at=? WHERE id=1""",
+-            (now(),int(settings['bet_second']),now()))
++            (now(),step,int(settings['bet_second']),now()))
+ 
+ def end_tool(reason='MANUAL_END',status='STOPPED'):
+     ensure_runtime()
+@@ -136,7 +147,7 @@
+ cc[3].metric("Step",f"{min(max(int(ctl.get('current_step') or 0),0),3)+1}/4")
+ cc[4].metric("Session P/L",money(ctl.get('session_profit')))
+ cc[5].metric("Real bets",int(ctl.get('session_bets') or 0))
+-cc[6].metric("Loss streak",f"{int(ctl.get('current_loss_streak') or 0)}/{int(ctl.get('longest_loss_streak') or 0)}")
++cc[6].metric("LOSS đã xác nhận",f"{int(ctl.get('current_loss_streak') or 0)}/{int(ctl.get('longest_loss_streak') or 0)}")
+ if ctl.get('stop_reason'): st.caption(f"Stop reason: {ctl.get('stop_reason')}")
+ if ctl.get('last_error'): st.error(str(ctl.get('last_error')))
+ 
+@@ -164,7 +175,7 @@
+ start_settings,start_errors=parse_start_settings(second_txt)
+ if start_errors:
+     st.error(" · ".join(start_errors))
+-st.caption(f"Submit tại countdown second {start_settings['bet_second']}. Cược thật chỉ dừng vì thiếu tiền cho 7 số hoặc lỗi vận hành không thể xác nhận lệnh; END/EMERGENCY STOP vẫn hoạt động.")
++st.caption(f"Submit tại countdown second {start_settings['bet_second']}. Nếu số dư sau submit không xác nhận được, bot coi lệnh đó là thua chỉ để chọn mức cược kỳ sau; lỗi thao tác/browser vẫn dừng.")
+ confirm=st.checkbox("Tôi xác nhận START sẽ cho phép cược thật 7 số với mức 2.000 → 6.000 → 8.000 → 10.000đ/số khi config dry_run=false và TOP7 Gate PASS.")
+ 
+ start_blockers=[]
+@@ -182,7 +193,7 @@
+ 
+ b1,b2,b3=st.columns(3)
+ if b1.button("▶ START TOOL",type="primary",use_container_width=True,disabled=bool(start_blockers)):
+-    start_tool(start_settings); st.success("Đã gửi START. Writer sẽ đọc số dư và đặt cược theo quy tắc mới khi TOP7 Gate PASS."); st.rerun()
++    start_tool(start_settings); st.success("Đã gửi START. Nếu lệnh gần nhất UNKNOWN, mức cược tiếp theo tăng như một lần thua."); st.rerun()
+ if b2.button("■ END TOOL",use_container_width=True):
+     end_tool('MANUAL_END','STOPPED'); st.warning("Đã END: không tạo lệnh mới. Lệnh đã submit trước đó vẫn được theo dõi."); st.rerun()
+ if b3.button("⛔ EMERGENCY STOP",use_container_width=True):
+@@ -364,7 +375,7 @@
+         rc[4].metric("Session P/L",money(ctl2.get('session_profit')))
+         rc[5].metric("Balance",money(ctl2.get('current_balance')))
+         bsec=int(ctl2.get('bet_second') or DEFAULT_REAL_SETTINGS['bet_second'])
+-        st.markdown("**Tự dừng:** thiếu tiền cho đủ 7 số. Lỗi login, số dư, chọn số, tổng tiền hoặc xác nhận lệnh cũng dừng để tránh gửi lệnh không kiểm soát.")
++        st.markdown("**Tự dừng:** thiếu tiền cho đủ 7 số hoặc lỗi login, browser, chọn số, tổng tiền. Không xác nhận được biến động số dư thì đánh dấu UNKNOWN và tăng mức như một lần thua; bot không gửi lại cùng kỳ.")
+         if ctl2.get('stop_reason') == 'INSUFFICIENT_BALANCE':
+             st.error(f"Tool đã dừng vì không đủ tiền cược. {ctl2.get('last_error') or ''}")
+         elif ctl2.get('stop_reason') and str(ctl2.get('status','')).startswith(('AUTO_STOPPED','ERROR')):
+@@ -383,12 +394,17 @@
+                     return 'Trúng' if int(row['actual_number']) in json.loads(row['selected_numbers_json']) else 'Trượt'
+                 except (KeyError,TypeError,ValueError):return None
+             rb['draw_hit']=rb.apply(draw_hit,axis=1)
+-            st.caption("Trúng/Trượt so theo số mở thưởng và 7 số đã chọn. Với lệnh UNKNOWN, đây chỉ là kết quả của dãy số; cần lịch sử 88i để xác nhận tiền cược đã được nhận.")
++            st.caption("Trúng/Trượt so theo số mở thưởng và 7 số đã chọn. Với lệnh UNKNOWN, đây chỉ là kết quả dãy số; số tiền thắng/thua chưa xác nhận. Mức cược kỳ sau vẫn tăng như một lần thua.")
++            latest=rb.iloc[-1]
++            if str(latest.get('status'))=='UNKNOWN':
++                st.warning(f"Kỳ {latest.get('issue')} chưa xác nhận website nhận cược. Bot tính một lần thua để chọn mức tiếp theo; hãy đối soát kỳ này trên 88i.")
++            rb['quy_tac_buoc']=rb['error_text'].fillna('').astype(str).apply(
++                lambda x:'Tính thua, chưa xác minh cược' if 'ASSUMED_LOSS_FOR_PROGRESSION_ONLY' in x else '')
+             settled=rb[rb['status'].isin(['WIN','LOSS'])].copy() if 'status' in rb else rb.iloc[0:0]
+             if len(settled):
+                 wins=int((settled['status']=='WIN').sum()); losses=int((settled['status']=='LOSS').sum()); pl=settled['profit'].fillna(0).sum(); ts=settled['total_stake'].fillna(0).sum()
+                 m=st.columns(4);m[0].metric('Settled',len(settled));m[1].metric('WIN/LOSS',f"{wins}/{losses}");m[2].metric('Hit',f"{wins/len(settled)*100:.2f}%");m[3].metric('P/L',money(pl),f"ROI {pl/ts*100:.2f}%" if ts else '-')
+-            cols=[c for c in ['issue','step_index','unit_multiplier','selected_numbers_json','stake_per_number','total_stake','status','actual_number','draw_hit','profit','balance_before','balance_after_submit','ticket_text','error_text','created_at','resolved_at'] if c in rb.columns]
++            cols=[c for c in ['issue','step_index','unit_multiplier','selected_numbers_json','stake_per_number','total_stake','status','quy_tac_buoc','actual_number','draw_hit','profit','balance_before','balance_after_submit','ticket_text','error_text','created_at','resolved_at'] if c in rb.columns]
+             st.dataframe(rb.tail(100)[cols].sort_index(ascending=False),use_container_width=True,hide_index=True)
+     with tabs[3]:
+         if stt is None:st.info("Chưa có system state")
+--- a/test_realbet.py
++++ b/test_realbet.py
+@@ -1,4 +1,5 @@
+ """Offline real-bet regression tests. Never connects to 88i or sends money."""
++import ast
+ import json
+ import sqlite3
+ import tempfile
+@@ -52,6 +53,16 @@
+             "live_samples": 80, "live_hit_rate": .72, "regime_samples": 50,
+             "regime_hit_rate": .72, "selected": [0, 1, 2, 3, 4, 5, 6]}
+     return dict(base, **changes)
++
++
++def dashboard_start_tool(db_path):
++    # Load only the START function; importing the dashboard would start Streamlit.
++    source=Path(__file__).with_name('wingo_dashboard_v7_6.py')
++    node=next(n for n in ast.parse(source.read_text(encoding='utf-8')).body
++              if isinstance(n,ast.FunctionDef) and n.name=='start_tool')
++    env={'db':lambda:sqlite3.connect(db_path),'ensure_runtime':lambda:None,'now':app.now}
++    exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),env)
++    return env['start_tool']
+ 
+ 
+ class RealWorkflowTests(unittest.TestCase):
+@@ -101,7 +112,67 @@
+         self.assertEqual(self.conn.execute("SELECT status,actual_number,profit FROM real_bets WHERE issue='643'").fetchone(),
+                          ("UNKNOWN", 4, None))
+         self.assertEqual(app.runtime_control(self.conn)["session_bets"], 0)
+-        self.assertEqual(app.maybe_place_real_bet(self.conn, "644", gate(), self.a, FakeExecutor()), "WAIT_OPEN_BET")
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "644", gate(), self.a, FakeExecutor()), "PLACED")
++
++    def test_unknown_balance_confirmation_continues_at_next_step(self):
++        class UnconfirmedExecutor(FakeExecutor):
++            def place_top7(self,*args,**kwargs):
++                super().place_top7(*args,**kwargs)
++                raise RealBetError('Balance did not confirm',may_have_submitted=True,
++                                   continue_as_loss=True)
++        uncertain=UnconfirmedExecutor()
++        self.assertEqual(app.maybe_place_real_bet(self.conn,"701",gate(),self.a,uncertain),
++                         "UNKNOWN_ASSUMED_LOSS")
++        ctl=app.runtime_control(self.conn)
++        self.assertEqual((ctl['real_bet_armed'],ctl['current_step'],ctl['session_bets']),(1,1,0))
++        row=self.conn.execute("SELECT status,profit,error_text FROM real_bets WHERE issue='701'").fetchone()
++        self.assertEqual(row[:2],('UNKNOWN',None))
++        self.assertIn('ASSUMED_LOSS_FOR_PROGRESSION_ONLY',row[2])
++        app.settle_real_bet(self.conn,"701",3,self.a)
++        self.assertEqual(app.runtime_control(self.conn)['current_step'],1)
++        next_order=FakeExecutor()
++        self.assertEqual(app.maybe_place_real_bet(self.conn,"702",gate(),self.a,next_order),"PLACED")
++        self.assertEqual(next_order.calls[-1][2:],(6000.0,42000.0))
++
++    def test_unknown_does_not_override_affordability_check(self):
++        class UnconfirmedExecutor(FakeExecutor):
++            def place_top7(self,*args,**kwargs):
++                result=super().place_top7(*args,**kwargs)
++                result['confirmed']=False
++                return result
++        uncertain=UnconfirmedExecutor(balance=20000)
++        self.assertEqual(app.maybe_place_real_bet(self.conn,"701",gate(),self.a,uncertain),
++                         "UNKNOWN_ASSUMED_LOSS")
++        self.assertEqual(app.maybe_place_real_bet(self.conn,"702",gate(),self.a,uncertain),
++                         "INSUFFICIENT_BALANCE")
++        self.assertEqual(len(uncertain.calls),1)
++
++    def test_page_error_unknown_still_stops(self):
++        class BrokenExecutor(FakeExecutor):
++            def place_top7(self,*args,**kwargs):
++                raise RealBetError('Trang đóng sau submit',may_have_submitted=True)
++        self.assertEqual(app.maybe_place_real_bet(self.conn,"701",gate(),self.a,BrokenExecutor()),
++                         "UNKNOWN")
++        self.assertEqual(app.runtime_control(self.conn)['real_bet_armed'],0)
++
++    def test_start_resumes_latest_unknown_without_counting_a_financial_loss(self):
++        with tempfile.TemporaryDirectory() as temp:
++            db_path=Path(temp)/'test.db'
++            conn=app.init_db(db_path,525000,3000)
++            try:
++                conn.execute("""INSERT INTO real_bets(issue,step_index,unit_multiplier,
++                    selected_numbers_json,stake_per_number,total_stake,odds,status,error_text,created_at)
++                    VALUES('202609252756',0,1,'[3,6,8,9,0,7,5]',2000,14000,9.895,
++                    'UNKNOWN','unconfirmed balance','now')""")
++                conn.commit()
++                dashboard_start_tool(db_path)({'bet_second':10})
++                state=app.runtime_control(conn)
++                self.assertEqual((state['current_step'],state['session_bets'],state['session_profit']),(1,0,0))
++                row=conn.execute("SELECT status,error_text FROM real_bets").fetchone()
++                self.assertEqual(row[0],'UNKNOWN')
++                self.assertIn('ASSUMED_LOSS_FOR_PROGRESSION_ONLY',row[1])
++            finally:
++                conn.close()
+ 
+     def test_losses_reach_ten_thousand_and_stay_there_until_win(self):
+         executor = FakeExecutor()
+@@ -428,6 +499,7 @@
+         with self.assertRaises(RealBetError) as result:
+             self.executor.place_top7("123", list(range(7)), 10, 70)
+         self.assertTrue(result.exception.may_have_submitted)
++        self.assertTrue(result.exception.continue_as_loss)
+         self.assertEqual(self.page.submit_count, 1)
+ 
+     def test_previous_win_payout_overlapping_debit_confirms_once(self):
+@@ -460,6 +532,7 @@
+         with self.assertRaises(RealBetError) as result:
+             self.executor.place_top7("123", list(range(7)), 10, 70)
+         self.assertTrue(result.exception.may_have_submitted)
++        self.assertFalse(result.exception.continue_as_loss)
+         self.assertEqual(self.page.submit_count, 1)
+ 
+     def test_out_of_range_number_rejected(self):

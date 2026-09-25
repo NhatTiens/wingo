@@ -1,0 +1,332 @@
+diff --git a/README.md b/README.md
+index f39f092..f1d5913 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,16 @@
+ # v7.6.3 — Visible Manual Login Real Bet
+ 
++## Cược thật TOP7 theo quy tắc x4
++
++Mỗi lệnh chỉ chọn 7 số. Mức mặc định là 2.000đ mỗi số, tổng 14.000đ.
++Nếu thua, lệnh tiếp theo là 8.000đ mỗi số, tổng 56.000đ. Nếu thua tiếp,
++lệnh tiếp theo là 32.000đ mỗi số, tổng 224.000đ. Nếu thua đủ ba lệnh liên tiếp,
++lệnh thứ tư trở lại 2.000đ mỗi số; chu kỳ này lặp lại nếu tiếp tục thua.
++Thắng ở bất cứ bước nào cũng trở lại 2.000đ mỗi số. Kỳ bị bỏ qua do TOP7 Gate
++không đạt không thay đổi bước. Bot phải có đủ số dư cho toàn bộ lệnh và vẫn áp dụng
++các điều kiện dừng của phiên, mặc định là dừng sau 5 lệnh thua liên tiếp.
++Chỉ mức cược thật đổi; các chiến thuật thử nghiệm trên giấy giữ nguyên.
++
+ ## Xác nhận cược và lệnh UNKNOWN
+ 
+ Sau khi bấm đặt cược, writer đọc số dư trực tiếp trên trang hiện tại tối đa 12 giây.
+@@ -17,7 +28,7 @@ python .\reconcile_real_bet.py --issue 202609252574
+ ```
+ 
+ Chỉ khi website xác nhận đúng kỳ `202609252574`, bảy số `4,9,8,7,6,1,3`
+-và tổng cược `21000`, đối soát (script tự tạo backup DB và chốt kết quả nếu đã có):
++và tổng cược cũ `21000`, đối soát (script tự tạo backup DB và chốt kết quả nếu đã có):
+ 
+ ```powershell
+ python .\reconcile_real_bet.py --issue 202609252574 --mark-placed --expected-numbers 4,9,8,7,6,1,3 --expected-total 21000
+diff --git a/reconcile_real_bet.py b/reconcile_real_bet.py
+index 7db3cf1..5b6f4e5 100644
+--- a/reconcile_real_bet.py
++++ b/reconcile_real_bet.py
+@@ -5,6 +5,7 @@ Read-only unless --mark-placed is supplied. Run with the writer stopped.
+ import argparse
+ import json
+ import sqlite3
++from contextlib import closing
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
+@@ -13,7 +14,7 @@ def reconcile(db, issue, mark_placed=False, expected_numbers=None, expected_tota
+     path = Path(db)
+     if not path.is_file():
+         raise ValueError(f"Không tìm thấy DB: {path}")
+-    with sqlite3.connect(path, timeout=10) as conn:
++    with closing(sqlite3.connect(path, timeout=10)) as conn:
+         row = conn.execute(
+             "SELECT selected_numbers_json,stake_per_number,total_stake,status,balance_before,error_text "
+             "FROM real_bets WHERE issue=?", (str(issue),)
+@@ -40,7 +41,7 @@ def reconcile(db, issue, mark_placed=False, expected_numbers=None, expected_tota
+         backup_path = path.with_name(f"{path.stem}.before-reconcile-{issue}.db")
+         if backup_path.exists():
+             raise ValueError(f"Đã có file backup {backup_path}; không ghi đè")
+-        with sqlite3.connect(backup_path) as backup:
++        with closing(sqlite3.connect(backup_path)) as backup:
+             conn.backup(backup)
+         conn.execute("BEGIN IMMEDIATE")
+         updated = conn.execute(
+@@ -53,7 +54,7 @@ def reconcile(db, issue, mark_placed=False, expected_numbers=None, expected_tota
+         known = conn.execute("SELECT number FROM results WHERE issue=?", (str(issue),)).fetchone()
+         if known:
+             # The same settlement logic used by the writer updates the session
+-            # progression and accounting, including the 1-1-2-3 step.
++            # progression and accounting, using the current real-bet rule.
+             import wingo_id77_adaptive_v7_6 as app
+             ctl_args = SimpleNamespace(real_stop_consecutive_losses=5,
+                                        real_stop_profit_pct=1.0,
+diff --git a/test_realbet.py b/test_realbet.py
+index 6a07f5b..0f93946 100644
+--- a/test_realbet.py
++++ b/test_realbet.py
+@@ -1,5 +1,6 @@
+ """Offline real-bet regression tests. Never connects to 88i or sends money."""
+ import json
++import sqlite3
+ import tempfile
+ import unittest
+ from pathlib import Path
+@@ -14,16 +15,17 @@ from reconcile_real_bet import reconcile
+ 
+ 
+ class FakeExecutor:
+-    def __init__(self, *, on_prepare=None, dry_run=False):
++    def __init__(self, *, on_prepare=None, dry_run=False, balance=1000000):
+         self.calls = []
+         self.on_prepare = on_prepare
+         self.dry_run = dry_run
++        self.balance = balance
+ 
+     def configured(self):
+         return True, "OK"
+ 
+     def read_balance(self):
+-        return 200000.0
++        return float(self.balance)
+ 
+     def place_top7(self, issue, numbers, stake, total, before_submit=None):
+         self.calls.append((issue, numbers, stake, total))
+@@ -31,14 +33,14 @@ class FakeExecutor:
+             self.on_prepare()
+         before_submit()
+         return {"ok": True, "confirmed": True, "dry_run": self.dry_run,
+-                "balance_after": 200000 - total, "ticket_text": "SIMULATED"}
++                "balance_after": self.balance - total, "ticket_text": "SIMULATED"}
+ 
+ 
+ def args():
+     return SimpleNamespace(
+         real_bet_enabled=True, real_stop_consecutive_losses=5,
+         real_stop_profit_pct=1.0, real_stop_balance_floor_pct=.50,
+-        real_stop_max_minutes=90, real_base_stake=3000,
++        real_stop_max_minutes=90, real_base_stake=2000,
+     )
+ 
+ 
+@@ -63,18 +65,57 @@ class RealWorkflowTests(unittest.TestCase):
+     def test_only_seven_number_bet_placed_once_and_settled(self):
+         executor = FakeExecutor()
+         self.assertEqual(app.maybe_place_real_bet(self.conn, "123", gate(), self.a, executor), "PLACED")
+-        self.assertEqual(executor.calls, [("123", [0, 1, 2, 3, 4, 5, 6], 3000.0, 21000.0)])
++        self.assertEqual(executor.calls, [("123", [0, 1, 2, 3, 4, 5, 6], 2000.0, 14000.0)])
+         self.assertEqual(app.maybe_place_real_bet(self.conn, "123", gate(), self.a, executor), "EXISTS")
+         self.assertEqual(len(executor.calls), 1)
+         row = self.conn.execute("SELECT selected_numbers_json,total_stake,status FROM real_bets").fetchone()
+         self.assertEqual(json.loads(row[0]), list(range(7)))
+-        self.assertEqual(row[1:], (21000, "OPEN"))
++        self.assertEqual(row[1:], (14000, "OPEN"))
+         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM paper_bets").fetchone()[0], 0)
+         app.settle_real_bet(self.conn, "123", 3, self.a)
+         self.assertEqual(self.conn.execute("SELECT status FROM real_bets").fetchone()[0], "WIN")
+-        self.assertEqual(app.runtime_control(self.conn)["current_step"], 1)
++        self.assertEqual(app.runtime_control(self.conn)["current_step"], 0)
+         self.assertEqual(app.maybe_place_real_bet(self.conn, "124", gate(), self.a, executor), "PLACED")
+         self.assertEqual(len(executor.calls), 2)
++        self.assertEqual(executor.calls[-1][2:], (2000.0, 14000.0))
++
++    def test_three_losses_multiply_by_four_then_fourth_bet_resets(self):
++        executor = FakeExecutor()
++        for issue, stake, total, next_step in [
++            ("101", 2000, 14000, 1),
++            ("102", 8000, 56000, 2),
++            ("103", 32000, 224000, 0),
++        ]:
++            self.assertEqual(app.maybe_place_real_bet(self.conn, issue, gate(), self.a, executor), "PLACED")
++            self.assertEqual(executor.calls[-1][2:], (float(stake), float(total)))
++            app.settle_real_bet(self.conn, issue, 9, self.a)
++            self.assertEqual(app.runtime_control(self.conn)["current_step"], next_step)
++        self.assertEqual(app.runtime_control(self.conn)["current_loss_streak"], 3)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "104", gate(), self.a, executor), "PLACED")
++        self.assertEqual(executor.calls[-1][2:], (2000.0, 14000.0))
++        self.assertEqual(self.conn.execute("SELECT unit_multiplier FROM real_bets WHERE issue='104'").fetchone()[0], 1)
++        self.assertEqual(app.runtime_control(self.conn)["real_bet_armed"], 1)
++
++    def test_win_after_loss_resets_next_stake_to_base(self):
++        executor = FakeExecutor()
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "201", gate(), self.a, executor), "PLACED")
++        app.settle_real_bet(self.conn, "201", 9, self.a)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "202", gate(), self.a, executor), "PLACED")
++        self.assertEqual(executor.calls[-1][2:], (8000.0, 56000.0))
++        app.settle_real_bet(self.conn, "202", 3, self.a)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "203", gate(), self.a, executor), "PLACED")
++        self.assertEqual(executor.calls[-1][2:], (2000.0, 14000.0))
++        self.assertEqual(app.runtime_control(self.conn)["current_loss_streak"], 0)
++
++    def test_insufficient_balance_blocks_highest_step_without_submit(self):
++        executor = FakeExecutor(balance=217370)
++        for issue in ("301", "302"):
++            self.assertEqual(app.maybe_place_real_bet(self.conn, issue, gate(), self.a, executor), "PLACED")
++            app.settle_real_bet(self.conn, issue, 9, self.a)
++        self.assertEqual(app.runtime_control(self.conn)["current_step"], 2)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "303", gate(), self.a, executor), "INSUFFICIENT_BALANCE")
++        self.assertEqual(len(executor.calls), 2)
++        self.assertEqual(app.runtime_control(self.conn)["real_bet_armed"], 0)
+ 
+     def test_real_decision_matches_actual_top7_gate_at_boundaries(self):
+         top_args = SimpleNamespace(
+@@ -161,10 +202,21 @@ class ReconciliationTests(unittest.TestCase):
+             self.assertEqual(reconcile(db, "123"), "UNKNOWN")
+             with self.assertRaisesRegex(ValueError, "Tổng cược"):
+                 reconcile(db, "123", True, list(range(7)), 7000)
+-            self.assertEqual(reconcile(db, "123", True, list(range(7)), 21000), "WIN")
++            real_connect = sqlite3.connect
++            connections = []
++            def tracked_connect(*args, **kwargs):
++                connection = real_connect(*args, **kwargs)
++                connections.append(connection)
++                return connection
++            with patch("reconcile_real_bet.sqlite3.connect", side_effect=tracked_connect):
++                self.assertEqual(reconcile(db, "123", True, list(range(7)), 21000), "WIN")
++            self.assertEqual(len(connections), 2)
++            for connection in connections:
++                with self.assertRaises(sqlite3.ProgrammingError):
++                    connection.execute("SELECT 1")
+             self.assertEqual(conn.execute("SELECT status FROM real_bets WHERE issue='123'").fetchone()[0], "WIN")
+             self.assertEqual(app.runtime_control(conn)["session_bets"], 1)
+-            self.assertEqual(app.runtime_control(conn)["current_step"], 1)
++            self.assertEqual(app.runtime_control(conn)["current_step"], 0)
+             self.assertTrue((Path(tmp) / "test.before-reconcile-123.db").is_file())
+             with self.assertRaisesRegex(ValueError, "Chỉ đối soát"):
+                 reconcile(db, "123", True, list(range(7)), 21000)
+diff --git a/wingo_dashboard_v7_6.py b/wingo_dashboard_v7_6.py
+index 858610f..afe7273 100644
+--- a/wingo_dashboard_v7_6.py
++++ b/wingo_dashboard_v7_6.py
+@@ -134,7 +134,7 @@ def config_status():
+     }
+ 
+ st.title("🎯 Wingo Adaptive v7.6.3 · VISIBLE REAL BET CONTROL")
+-st.caption("TOP7 · Real 1-1-2-3 · Chromium hiển thị · login thủ công mỗi lần chạy · configurable STOP · START/END")
++st.caption("TOP7 · Real x4: 2.000 → 8.000 → 32.000đ/số · Chromium hiển thị · login thủ công mỗi lần chạy · START/END")
+ ensure_runtime()
+ ctl=read_runtime()
+ _cfg=config_status()
+@@ -151,7 +151,7 @@ cc=st.columns([1.2,1.2,1.2,1,1,1,1])
+ cc[0].metric("Tool",str(ctl.get('status','STOPPED')))
+ cc[1].metric("Real Bet","ARMED" if int(ctl.get('real_bet_armed') or 0) else "DISARMED")
+ cc[2].metric("Số dư web",money(ctl.get('current_balance')))
+-cc[3].metric("Step",f"{int(ctl.get('current_step') or 0)+1}/4")
++cc[3].metric("Step",f"{min(max(int(ctl.get('current_step') or 0),0),2)+1}/3")
+ cc[4].metric("Session P/L",money(ctl.get('session_profit')))
+ cc[5].metric("Real bets",int(ctl.get('session_bets') or 0))
+ cc[6].metric("Loss streak",f"{int(ctl.get('current_loss_streak') or 0)}/{int(ctl.get('longest_loss_streak') or 0)}")
+@@ -192,7 +192,7 @@ st.caption(
+     f"· số dư ≤ {start_settings['stop_balance_floor_pct']*100:.0f}% vốn lúc START · {start_settings['stop_max_minutes']:.0f} phút "
+     f"· submit tại countdown second {start_settings['bet_second']}."
+ )
+-confirm=st.checkbox("Tôi xác nhận START sẽ cho phép chiến thuật 1-1-2-3 đặt cược thật khi config dry_run=false và TOP7 Gate PASS.")
++confirm=st.checkbox("Tôi xác nhận START sẽ cho phép cược thật 7 số theo quy tắc x4 (2.000 → 8.000 → 32.000đ/số) khi config dry_run=false và TOP7 Gate PASS.")
+ 
+ start_blockers=[]
+ if not confirm: start_blockers.append("chưa tick xác nhận")
+@@ -230,7 +230,7 @@ def render():
+     c[0].metric("Tổng kỳ",len(res));c[1].metric("Kỳ",latest["issue"]);c[2].metric("Số",int(latest["number"]));c[3].metric("KQ",latest.get("size","-"))
+     c[4].metric("Regime",stt["regime_label"] if stt is not None else "-");c[5].metric("Health",stt["data_health"] if stt is not None else "-")
+     c[6].metric("Drift",num(stt["drift_score"]) if stt is not None else "-");c[7].metric("ECE",num(stt["calibration_ece"]) if stt is not None else "-")
+-    tabs=st.tabs(["🧠 Prediction","7️⃣ TOP7","💵 REAL 1-1-2-3","🧭 Regime","🎯 Calibration","⚖️ Models","🩺 Data Health","💰 Paper","📊 History"])
++    tabs=st.tabs(["🧠 Prediction","7️⃣ TOP7","💵 REAL x4","🧭 Regime","🎯 Calibration","⚖️ Models","🩺 Data Health","💰 Paper","📊 History"])
+     with tabs[0]:
+         if pred is None or pred.empty:st.info("Chưa có predictions")
+         else:
+@@ -379,15 +379,15 @@ Live/Regime luôn dùng tối đa 80 mẫu gần nhất: mẫu mới vào thì m
+             cols=[c for c in ["issue","strategy","step_index","unit_multiplier","selected_numbers_json","stake_per_number","total_stake","status","actual_number","profit","bankroll_after","created_at","resolved_at"] if c in stratbets.columns]
+             st.dataframe(stratbets.tail(120)[cols].sort_index(ascending=False),use_container_width=True,hide_index=True)
+     with tabs[2]:
+-        st.subheader("💵 REAL BET · chiến thuật 1-1-2-3")
+-        st.caption("Step: 1→1→2→3. WIN đi bước tiếp theo; LOSS reset step 1; thắng step 4 cũng reset step 1. SKIP không đổi step.")
++        st.subheader("💵 REAL BET · x4 sau mỗi tay thua")
++        st.caption("Tay 1: 2.000đ/số · tay 2 sau thua: 8.000đ/số · tay 3 sau hai lần thua: 32.000đ/số. Thua tay 3 thì tay 4 về 2.000đ/số. Thắng ở bất kỳ tay nào cũng về 2.000đ/số; SKIP giữ nguyên bước.")
+         ctl2=read_runtime()
+-        pattern=[1,1,2,3]; step=max(0,min(int(ctl2.get('current_step') or 0),3)); unit=pattern[step]
++        pattern=[1,4,16]; step=max(0,min(int(ctl2.get('current_step') or 0),2)); unit=pattern[step]
+         rc=st.columns(6)
+         rc[0].metric("Status",str(ctl2.get('status','STOPPED')))
+-        rc[1].metric("Current step",f"{step+1}/4",f"x{unit}")
+-        rc[2].metric("Mặc định / số",money(3000*unit))
+-        rc[3].metric("Tổng 7 số",money(3000*unit*7))
++        rc[1].metric("Current step",f"{step+1}/3",f"x{unit}")
++        rc[2].metric("Mặc định / số",money(2000*unit))
++        rc[3].metric("Tổng 7 số",money(2000*unit*7))
+         rc[4].metric("Session P/L",money(ctl2.get('session_profit')))
+         rc[5].metric("Balance",money(ctl2.get('current_balance')))
+         loss_lim=int(ctl2.get('stop_consecutive_losses') or DEFAULT_REAL_SETTINGS['stop_consecutive_losses'])
+diff --git a/wingo_id77_adaptive_v7_6.py b/wingo_id77_adaptive_v7_6.py
+index 6882ccf..f515315 100644
+--- a/wingo_id77_adaptive_v7_6.py
++++ b/wingo_id77_adaptive_v7_6.py
+@@ -16,6 +16,7 @@ MODEL_NAMES = ["rolling","markov1","markov2","markov3","logistic","random_forest
+ PRIORS = {"rolling":.25,"markov1":.20,"markov2":.18,"markov3":.12,"logistic":.10,"random_forest":.08,"hist_gradient_boosting":.07}
+ TOP7_ODDS = 9.895
+ TOP7_COUNT = 7
++REAL_BET_MULTIPLIERS = (1, 4, 16)
+ TOP7_BREAK_EVEN = TOP7_COUNT / TOP7_ODDS
+ 
+ def now(): return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+@@ -920,10 +921,11 @@ def settle_real_bet(conn,issue,n,args):
+     cls=int(ctl.get("current_loss_streak") or 0)
+     lls=int(ctl.get("longest_loss_streak") or 0)
+     if won:
+-        next_step=int(step)+1 if int(step)+1<4 else 0
++        next_step=0
+         cws+=1; cls=0
+     else:
+-        next_step=0; cws=0; cls+=1; lls=max(lls,cls)
++        next_step=(int(step)+1)%len(REAL_BET_MULTIPLIERS)
++        cws=0; cls+=1; lls=max(lls,cls)
+ 
+     # balance_after_submit đã trừ stake. Khi kỳ resolve, website cộng payout nếu WIN.
+     curbal=ctl.get("current_balance")
+@@ -965,9 +967,8 @@ def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
+     if reason:
+         stop_real_tool(conn,reason)
+         return reason
+-    pattern=[1,1,2,3]
+-    step=max(0,min(int(ctl.get("current_step") or 0),len(pattern)-1))
+-    unit=float(pattern[step])
++    step=max(0,min(int(ctl.get("current_step") or 0),len(REAL_BET_MULTIPLIERS)-1))
++    unit=float(REAL_BET_MULTIPLIERS[step])
+     stake_per=float(args.real_base_stake)*unit
+     total=stake_per*TOP7_COUNT
+     if balance<total:
+@@ -1482,12 +1483,12 @@ def main():
+     ap.add_argument("--strategy-reset",action="store_true",help="Xóa lịch sử test 3 chiến thuật và reset về vốn ban đầu")
+     ap.add_argument("--strategy-bets-csv",default="wingo_strategy_bets.csv")
+     ap.add_argument("--strategy-state-csv",default="wingo_strategy_state.csv")
+-    # v7.6 real betting: 1-1-2-3 only. Runtime starts STOPPED; dashboard START is required.
++    # Real betting uses x4 after each loss, then resets after three losses or a win.
+     ap.add_argument("--real-bet-enabled",action=argparse.BooleanOptionalAction,default=True)
+     ap.add_argument("--real-resume-after-restart",action=argparse.BooleanOptionalAction,default=False,help="Mặc định false: writer restart/reboot sẽ DISARM real bet")
+     ap.add_argument("--real-config",default="88i_realbet_config.json")
+     ap.add_argument("--real-profile-dir",default="88i_browser_profile",help="Chỉ dùng khi login.mode=persistent; manual_each_run không cần profile")
+-    ap.add_argument("--real-base-stake",type=float,default=3000)
++    ap.add_argument("--real-base-stake",type=float,default=2000)
+     ap.add_argument("--real-bet-second",type=int,default=10,help="API countdown second để submit real bet; dashboard có thể override khi START")
+     ap.add_argument("--real-stop-consecutive-losses",type=int,default=5)
+     ap.add_argument("--real-stop-profit-pct",type=float,default=1.0,help="1.0 = +100 phần trăm so với balance lúc START")
+@@ -1501,11 +1502,12 @@ def main():
+         conn.execute("""UPDATE runtime_control SET tool_running=0,real_bet_armed=0,status='STOPPED_RESTART',ended_at=?,
+             stop_reason='SERVICE_RESTART_REQUIRES_MANUAL_START',updated_at=? WHERE id=1""",(now(),now())); conn.commit()
+     real_executor=RealBetExecutor(args.real_config,args.real_profile_dir) if args.real_bet_enabled else None
+-    print("WINGO ADAPTIVE v7.6.3 TOP7 · VISIBLE MANUAL LOGIN · REAL 1-1-2-3 | writer process"); print("API:",API_URL)
++    print("WINGO ADAPTIVE v7.6.3 TOP7 · VISIBLE MANUAL LOGIN · REAL x4 | writer process"); print("API:",API_URL)
+     print(f"3 strategy paper test: vốn mô phỏng={money(args.strategy_bankroll)}/strategy | base={money(args.strategy_base_stake)}/số")
+     print("Patterns: FLAT=[1] | 1-1-2-3 | 1-3-2-6. WIN đi bước kế tiếp; LOSS reset; hết pattern reset.")
+     print("Balanced Gate v7.6: Live/Regime rolling tối đa 80. Paper: FLAT, 1-1-2-3, 1-3-2-6.")
+-    print("REAL BET 1-1-2-3: Chromium HIỂN THỊ + login thủ công mỗi lần chạy; prediction second20, real submit default second10; START/END tại dashboard.")
++    print(f"REAL BET x4: {money(args.real_base_stake)}/số → {money(args.real_base_stake*4)}/số → {money(args.real_base_stake*16)}/số; 3 LOSS hoặc WIN reset; chỉ 7 số, không cược Lớn/Nhỏ.")
++    print("Chromium HIỂN THỊ + login thủ công mỗi lần chạy; prediction second20, real submit default second10; START/END tại dashboard.")
+     # v7.6.2: login diễn ra TRƯỚC vòng prediction để không đợi tới giây cược mới mở browser.
+     # Runtime vẫn STOPPED/DISARMED sau restart; login thành công KHÔNG tự đặt cược.
+     if real_executor is not None:
