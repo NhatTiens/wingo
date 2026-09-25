@@ -192,7 +192,7 @@ st.caption(
     f"· số dư ≤ {start_settings['stop_balance_floor_pct']*100:.0f}% vốn lúc START · {start_settings['stop_max_minutes']:.0f} phút "
     f"· submit tại countdown second {start_settings['bet_second']}."
 )
-confirm=st.checkbox("Tôi xác nhận START sẽ cho phép chiến thuật 1-1-2-3 đặt cược thật khi config dry_run=false và Real Gate PASS.")
+confirm=st.checkbox("Tôi xác nhận START sẽ cho phép chiến thuật 1-1-2-3 đặt cược thật khi config dry_run=false và TOP7 Gate PASS.")
 
 start_blockers=[]
 if not confirm: start_blockers.append("chưa tick xác nhận")
@@ -397,7 +397,7 @@ Live/Regime luôn dùng tối đa 80 mẫu gần nhất: mẫu mới vào thì m
         bsec=int(ctl2.get('bet_second') or DEFAULT_REAL_SETTINGS['bet_second'])
         st.markdown(f"**STOP đang dùng:** {loss_lim} LOSS liên tiếp · balance đạt +{prof:.0f}% so với lúc START · balance giảm còn {floor:.0f}% vốn lúc START · {mins:.0f} phút · lỗi login/balance/0-9/selector/tổng tiền/xác nhận → STOP.")
         st.caption(f"Prediction chạy sớm; real submit được lên lịch tại countdown second {bsec}. Không có giới hạn số lệnh.")
-        st.markdown("**Real Gate chặt hơn paper:** Calibrated ≥72% · Consensus ≥60% · Stability ≥80% · Drift ≤0,40 · Live80 ≥73% đủ 80 mẫu · Regime ≥73% đủ 50 mẫu · Health=OK.")
+        st.markdown("**Cược thật dùng đúng TOP7 Gate:** Health=OK · Calibrated ≥72% · Consensus ≥55% · Stability ≥75% · Drift ≤0,45 · Live hit ≥72% khi đủ 80 mẫu · Regime hit ≥72% khi đủ 50 mẫu.")
         if realbets is None or realbets.empty:
             st.info("Chưa có real bet audit. Có thể START ở dry-run sau khi config selector.")
         else:

@@ -873,24 +873,11 @@ def ensure_real_session(conn,args,executor):
     return True
 
 
-def real_gate_check(gate,args):
-    failed=[]
-    if not gate.get("passed"): failed.append("TOP7_GATE")
-    if str(gate.get("data_health") or "")!="OK": failed.append("DATA_HEALTH")
-    if float(gate.get("calibrated_prob") or 0)<args.real_calibrated_min: failed.append("CALIBRATED")
-    if float(gate.get("consensus_score") or 0)<args.real_consensus_min: failed.append("CONSENSUS")
-    if float(gate.get("stability_score") or 0)<args.real_stability_min: failed.append("STABILITY")
-    if float(gate.get("drift_score") or 999)>args.real_max_drift: failed.append("DRIFT")
-    live_n = int(gate.get("live_samples") or 0)
-    if live_n >= args.real_live_required_samples:
-        if float(gate.get("live_hit_rate") or 0) < args.real_live_min_hit:
-            failed.append("LIVE_HIT")
-
-    regime_n = int(gate.get("regime_samples") or 0)
-    if regime_n >= args.real_regime_required_samples:
-        if float(gate.get("regime_hit_rate") or 0) < args.real_regime_min_hit:
-            failed.append("REGIME_HIT")
-    return len(failed)==0,failed
+def real_gate_check(gate):
+    """Cược thật dùng đúng quyết định và lý do của TOP7 Gate."""
+    if gate.get("passed") is True:
+        return True, []
+    return False, list(gate.get("failed") or ["TOP7_GATE"])
 
 
 def real_auto_stop_reason(ctl,args,balance=None):
@@ -970,9 +957,9 @@ def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
     if reason:
         stop_real_tool(conn,reason)
         return reason
-    ok,failed=real_gate_check(gate,args)
+    ok,failed=real_gate_check(gate)
     if not ok:
-        return "REAL_GATE_SKIP:"+",".join(failed)
+        return "TOP7_GATE_SKIP:"+",".join(failed)
     ctl=runtime_control(conn)
     reason=real_auto_stop_reason(ctl,args,balance=balance)
     if reason:
@@ -1502,14 +1489,6 @@ def main():
     ap.add_argument("--real-profile-dir",default="88i_browser_profile",help="Chỉ dùng khi login.mode=persistent; manual_each_run không cần profile")
     ap.add_argument("--real-base-stake",type=float,default=3000)
     ap.add_argument("--real-bet-second",type=int,default=10,help="API countdown second để submit real bet; dashboard có thể override khi START")
-    ap.add_argument("--real-calibrated-min",type=float,default=.72)
-    ap.add_argument("--real-consensus-min",type=float,default=.60)
-    ap.add_argument("--real-stability-min",type=float,default=.80)
-    ap.add_argument("--real-max-drift",type=float,default=.40)
-    ap.add_argument("--real-live-min-hit",type=float,default=.73)
-    ap.add_argument("--real-live-required-samples",type=int,default=80)
-    ap.add_argument("--real-regime-min-hit",type=float,default=.73)
-    ap.add_argument("--real-regime-required-samples",type=int,default=50)
     ap.add_argument("--real-stop-consecutive-losses",type=int,default=5)
     ap.add_argument("--real-stop-profit-pct",type=float,default=1.0,help="1.0 = +100 phần trăm so với balance lúc START")
     ap.add_argument("--real-stop-balance-floor-pct",type=float,default=.50,help="0.50 = dừng khi còn 50 phần trăm balance lúc START")
