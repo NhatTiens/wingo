@@ -16,6 +16,7 @@ Bản này được cấu hình theo yêu cầu:
 - Tool không nhận, không ghi file và không lưu username/password.
 - Sau login, Chromium giữ mở để bạn nhìn thấy chọn TOP7, nhập tiền và click Đặt Cược.
 - `dry_run=false`: đây là chế độ cược tiền thật.
+- Luồng cược thật chỉ chọn 7 số TOP7 và đặt cùng mức tiền cho mỗi số. Mặc định paper bet Lớn/Nhỏ cũng tắt; các xác suất Lớn/Nhỏ vẫn được in để quan sát.
 - Writer restart luôn STOPPED/DISARMED; login thành công không tự đặt cược. Bạn vẫn phải tick xác nhận và bấm START TOOL trên dashboard.
 
 ## Điều kiện STOP mặc định
@@ -63,3 +64,5 @@ Hãy restart writer để mở Chromium sạch, đăng nhập lại rồi START 
 ## Lưu ý
 
 `dry_run=false` trong package này vì đây là bản visible real-bet theo yêu cầu. START TOOL vẫn là công tắc bắt buộc.
+
+Kiểm thử offline, không chạm website và không gửi lệnh tiền thật: `python -m unittest -v test_realbet`. Các kiểm thử xác nhận gate, giỏ 7 số, trạng thái END, kỳ cược đổi, giỏ cũ, dry run, cược trùng và xác nhận lệnh. Việc trang 88i thực tế có còn đúng selector và hiển thị tổng tiền như cấu hình chỉ xác nhận được khi chạy dry run trên tài khoản đã đăng nhập.

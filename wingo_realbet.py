@@ -6,7 +6,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class RealBetError(RuntimeError):
@@ -79,10 +79,20 @@ class RealBetExecutor:
             return False, f"Thiếu persistent profile: {self.profile_dir}"
         if login_mode == "manual_each_run" and bool(cfg.get("headless", False)):
             return False, "manual_each_run yêu cầu headless=false để người dùng đăng nhập trên Chromium"
+        if str(cfg.get("target_url") or "") != "https://www.88idd.com/home/#/lottery?tabName=Lottery&id=77":
+            return False, "target_url phải là trang Wingo id=77 đã kiểm tra"
+        if str((cfg.get("selection") or {}).get("expected_selected_count", "")) != "7":
+            return False, "expected_selected_count phải bằng 7"
+        if str((cfg.get("stake") or {}).get("expected_row_inputs", "")) != "7":
+            return False, "expected_row_inputs phải bằng 7"
+        if str((cfg.get("success") or {}).get("mode") or "") != "balance_decrease":
+            return False, "Xác nhận cược thật phải dùng balance_decrease"
 
         required = {
             "balance.selector": (cfg.get("balance") or {}).get("selector"),
             "selection.number_button_selector_template": (cfg.get("selection") or {}).get("number_button_selector_template"),
+            "selection.selected_selector": (cfg.get("selection") or {}).get("selected_selector"),
+            "selection.clear_selector": (cfg.get("selection") or {}).get("clear_selector"),
             "stake.shared_input_selector": (cfg.get("stake") or {}).get("shared_input_selector"),
             "stake.row_input_selector": (cfg.get("stake") or {}).get("row_input_selector"),
             "total.selector": (cfg.get("total") or {}).get("selector"),
@@ -211,7 +221,8 @@ class RealBetExecutor:
     def _goto(self, force=False):
         page = self.page
         url = str(self.cfg.get("target_url") or "https://www.88idd.com/home/#/lottery?tabName=Lottery&id=77")
-        if force or not page.url.startswith("https://www.88idd.com/"):
+        # A logged-in page for another lottery or another tab is not our target.
+        if force or page.url != url:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(int((self.cfg.get("timing") or {}).get("page_ready_ms", 1800)))
         return page
@@ -298,8 +309,10 @@ class RealBetExecutor:
                 raise RealBetError(f"Stake row {i+1}={v:.0f}, expected={expected:.0f}")
         return vals
 
-    def place_top7(self, issue: str, numbers: list[int], stake_per_number: float, expected_total: float) -> dict[str, Any]:
-        if len(numbers) != 7 or len(set(int(x) for x in numbers)) != 7:
+    def place_top7(self, issue: str, numbers: list[int], stake_per_number: float, expected_total: float,
+                   before_submit: Callable[[], None] | None = None) -> dict[str, Any]:
+        if (len(numbers) != 7 or any(type(x) is not int or x not in range(10) for x in numbers)
+                or len(set(numbers)) != 7):
             raise RealBetError(f"TOP7 không hợp lệ: {numbers}")
         if stake_per_number <= 0 or expected_total <= 0:
             raise RealBetError("Stake không hợp lệ")
@@ -325,11 +338,17 @@ class RealBetExecutor:
 
         # Xóa giỏ cũ nếu đang còn lựa chọn từ lần trước.
         clear_sel = str(selection.get("clear_selector") or "").strip()
-        if clear_sel:
-            clear_loc = page.locator(clear_sel)
-            if clear_loc.count() == 1 and clear_loc.first.is_visible():
-                clear_loc.first.click()
-                page.wait_for_timeout(200)
+        selected_sel = str(selection.get("selected_selector") or "").strip()
+        if not selected_sel:
+            raise RealBetError("Thiếu selected_selector để xác nhận giỏ chỉ chứa TOP7")
+        if page.locator(selected_sel).count():
+            clear_loc = page.locator(clear_sel) if clear_sel else None
+            if clear_loc is None or clear_loc.count() != 1 or not clear_loc.first.is_visible():
+                raise RealBetError("Giỏ đang có lựa chọn và không thể xóa an toàn")
+            clear_loc.first.click()
+            page.wait_for_timeout(200)
+            if page.locator(selected_sel).count():
+                raise RealBetError("Giỏ vẫn còn lựa chọn sau khi xóa")
 
         template = str(selection.get("number_button_selector_template") or "").strip()
         for n in numbers:
@@ -338,12 +357,9 @@ class RealBetExecutor:
             el.click()
             page.wait_for_timeout(int(timing.get("between_number_click_ms", 120)))
 
-        selected_sel = str(selection.get("selected_selector") or "").strip()
-        if selected_sel:
-            count = page.locator(selected_sel).count()
-            expected_count = int(selection.get("expected_selected_count", 7))
-            if count != expected_count:
-                raise RealBetError(f"Selected-count mismatch: web={count}, expected={expected_count}")
+        count = page.locator(selected_sel).count()
+        if count != 7:
+            raise RealBetError(f"Selected-count mismatch: web={count}, expected=7")
 
         shared = self._one(page, str(stake_cfg.get("shared_input_selector") or ""), "shared stake input")
         shared.click()
@@ -392,6 +408,8 @@ class RealBetExecutor:
         latest_cfg = load_config(self.config_path)
         if not bool(latest_cfg.get("enabled", False)) or bool(latest_cfg.get("dry_run", True)):
             raise RealBetError("Config đổi sang disabled/dry_run trước submit → hủy lệnh")
+        if before_submit is not None:
+            before_submit()
 
         submit_sel = str((cfg.get("submit") or {}).get("selector") or "").strip()
         submit = self._one(page, submit_sel, "submit")
@@ -400,7 +418,12 @@ class RealBetExecutor:
             page.bring_to_front()
         except Exception:
             pass
-        submit.click()
+        try:
+            submit.click()
+        except Exception as exc:
+            # Playwright can time out after dispatching the click. Treat it as an
+            # uncertain submission so a later START cannot silently retry it.
+            raise RealBetError("Không rõ click submit đã gửi lệnh hay chưa", may_have_submitted=True) from exc
         result["submitted"] = True
         page.wait_for_timeout(int(timing.get("after_submit_ms", 500)))
 

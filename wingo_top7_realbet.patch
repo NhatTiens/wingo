@@ -1,0 +1,449 @@
+diff --git a/README.md b/README.md
+index e157bfb..0b656b7 100644
+--- a/README.md
++++ b/README.md
+@@ -16,6 +16,7 @@ Bản này được cấu hình theo yêu cầu:
+ - Tool không nhận, không ghi file và không lưu username/password.
+ - Sau login, Chromium giữ mở để bạn nhìn thấy chọn TOP7, nhập tiền và click Đặt Cược.
+ - `dry_run=false`: đây là chế độ cược tiền thật.
++- Luồng cược thật chỉ chọn 7 số TOP7 và đặt cùng mức tiền cho mỗi số. Mặc định paper bet Lớn/Nhỏ cũng tắt; các xác suất Lớn/Nhỏ vẫn được in để quan sát.
+ - Writer restart luôn STOPPED/DISARMED; login thành công không tự đặt cược. Bạn vẫn phải tick xác nhận và bấm START TOOL trên dashboard.
+ 
+ ## Điều kiện STOP mặc định
+@@ -63,3 +64,5 @@ Hãy restart writer để mở Chromium sạch, đăng nhập lại rồi START
+ ## Lưu ý
+ 
+ `dry_run=false` trong package này vì đây là bản visible real-bet theo yêu cầu. START TOOL vẫn là công tắc bắt buộc.
++
++Kiểm thử offline, không chạm website và không gửi lệnh tiền thật: `python -m unittest -v test_realbet`. Các kiểm thử xác nhận gate, giỏ 7 số, trạng thái END, kỳ cược đổi, giỏ cũ, dry run, cược trùng và xác nhận lệnh. Việc trang 88i thực tế có còn đúng selector và hiển thị tổng tiền như cấu hình chỉ xác nhận được khi chạy dry run trên tài khoản đã đăng nhập.
+diff --git a/wingo_id77_adaptive_v7_6.py b/wingo_id77_adaptive_v7_6.py
+index 166ca69..97d7250 100644
+--- a/wingo_id77_adaptive_v7_6.py
++++ b/wingo_id77_adaptive_v7_6.py
+@@ -940,7 +940,7 @@ def settle_real_bet(conn,issue,n,args):
+         stop_real_tool(conn,reason)
+ 
+ 
+-def maybe_place_real_bet(conn,issue,gate,args,executor):
++def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
+     ctl=runtime_control(conn)
+     if not ctl or not int(ctl.get("tool_running") or 0) or not int(ctl.get("real_bet_armed") or 0):
+         return "STOPPED"
+@@ -979,7 +979,16 @@ def maybe_place_real_bet(conn,issue,gate,args,executor):
+         (str(issue),step,unit,json.dumps(gate["selected"]),stake_per,total,TOP7_ODDS,gate.get("calibrated_prob"),"PREPARED",balance,created))
+     conn.commit()
+     try:
+-        result=executor.place_top7(str(issue),gate["selected"],stake_per,total)
++        def before_submit():
++            current=runtime_control(conn)
++            if (not current or not int(current.get("tool_running") or 0)
++                    or not int(current.get("real_bet_armed") or 0)):
++                raise RealBetError("Tool đã END/STOP trong lúc chuẩn bị giỏ")
++            if real_auto_stop_reason(current,args,balance=current.get("current_balance")):
++                raise RealBetError("Điều kiện dừng đã kích hoạt trước submit")
++            if submit_guard is not None:
++                submit_guard()
++        result=executor.place_top7(str(issue),gate["selected"],stake_per,total,before_submit=before_submit)
+         if bool(result.get("dry_run")):
+             conn.execute("""UPDATE real_bets SET status='DRY_RUN',balance_after_submit=?,ticket_text=?,error_text=? WHERE issue=?""",
+                          (result.get("balance_after"),result.get("ticket_text"),"DRY_RUN: submit không được click",str(issue)))
+@@ -1428,7 +1437,7 @@ def main():
+     ap.add_argument("--db",default="wingo_88i_id77.db"); ap.add_argument("--csv",default="wingo_88i_id77.csv")
+     ap.add_argument("--bets-csv",default="wingo_paper_bets.csv"); ap.add_argument("--predictions-csv",default="wingo_predictions.csv"); ap.add_argument("--performance-csv",default="wingo_model_performance.csv")
+     ap.add_argument("--trigger-second",type=int,default=20); ap.add_argument("--poll",type=float,default=.12)
+-    ap.add_argument("--paper-market",choices=["off","size","color","number","best"],default="size")
++    ap.add_argument("--paper-market",choices=["off","size","color","number","best"],default="off")
+     ap.add_argument("--signal-threshold",type=float,default=.55); ap.add_argument("--min-edge",type=float,default=.05)
+     ap.add_argument("--stake",type=float,default=50000); ap.add_argument("--bankroll",type=float,default=1000000)
+     ap.add_argument("--performance-lookback",type=int,default=300); ap.add_argument("--min-live-predictions",type=int,default=30)
+@@ -1560,7 +1569,13 @@ def main():
+                             pbet,_=wait_to_target(s,li,bet_sec,args.poll)
+                             bi=timing(pbet) if pbet else li
+                         if bi["issue"]==info["issue"] and bi["second"]<=bet_sec and bi["second"]>int(bi.get("close",3)):
+-                            status=maybe_place_real_bet(conn,info["issue"],gate,args,real_executor)
++                            def current_issue_guard():
++                                current=timing(fetch(s))
++                                if (current["issue"]!=info["issue"]
++                                        or current["second"]<=int(current["close"])+1):
++                                    raise RealBetError("Kỳ cược đã đổi hoặc quá sát giờ khóa cược")
++                            status=maybe_place_real_bet(conn,info["issue"],gate,args,real_executor,
++                                                        submit_guard=current_issue_guard)
+                             print(f"[REAL @ second={bi['second']:02d}] {status}")
+                             export_real_bets(conn,args)
+                         else:
+diff --git a/wingo_realbet.py b/wingo_realbet.py
+index eb9f50d..554ea7d 100644
+--- a/wingo_realbet.py
++++ b/wingo_realbet.py
+@@ -6,7 +6,7 @@ import json
+ import re
+ import time
+ from pathlib import Path
+-from typing import Any
++from typing import Any, Callable
+ 
+ 
+ class RealBetError(RuntimeError):
+@@ -79,10 +79,20 @@ class RealBetExecutor:
+             return False, f"Thiếu persistent profile: {self.profile_dir}"
+         if login_mode == "manual_each_run" and bool(cfg.get("headless", False)):
+             return False, "manual_each_run yêu cầu headless=false để người dùng đăng nhập trên Chromium"
++        if str(cfg.get("target_url") or "") != "https://www.88idd.com/home/#/lottery?tabName=Lottery&id=77":
++            return False, "target_url phải là trang Wingo id=77 đã kiểm tra"
++        if str((cfg.get("selection") or {}).get("expected_selected_count", "")) != "7":
++            return False, "expected_selected_count phải bằng 7"
++        if str((cfg.get("stake") or {}).get("expected_row_inputs", "")) != "7":
++            return False, "expected_row_inputs phải bằng 7"
++        if str((cfg.get("success") or {}).get("mode") or "") != "balance_decrease":
++            return False, "Xác nhận cược thật phải dùng balance_decrease"
+ 
+         required = {
+             "balance.selector": (cfg.get("balance") or {}).get("selector"),
+             "selection.number_button_selector_template": (cfg.get("selection") or {}).get("number_button_selector_template"),
++            "selection.selected_selector": (cfg.get("selection") or {}).get("selected_selector"),
++            "selection.clear_selector": (cfg.get("selection") or {}).get("clear_selector"),
+             "stake.shared_input_selector": (cfg.get("stake") or {}).get("shared_input_selector"),
+             "stake.row_input_selector": (cfg.get("stake") or {}).get("row_input_selector"),
+             "total.selector": (cfg.get("total") or {}).get("selector"),
+@@ -211,7 +221,8 @@ class RealBetExecutor:
+     def _goto(self, force=False):
+         page = self.page
+         url = str(self.cfg.get("target_url") or "https://www.88idd.com/home/#/lottery?tabName=Lottery&id=77")
+-        if force or not page.url.startswith("https://www.88idd.com/"):
++        # A logged-in page for another lottery or another tab is not our target.
++        if force or page.url != url:
+             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+             page.wait_for_timeout(int((self.cfg.get("timing") or {}).get("page_ready_ms", 1800)))
+         return page
+@@ -298,8 +309,10 @@ class RealBetExecutor:
+                 raise RealBetError(f"Stake row {i+1}={v:.0f}, expected={expected:.0f}")
+         return vals
+ 
+-    def place_top7(self, issue: str, numbers: list[int], stake_per_number: float, expected_total: float) -> dict[str, Any]:
+-        if len(numbers) != 7 or len(set(int(x) for x in numbers)) != 7:
++    def place_top7(self, issue: str, numbers: list[int], stake_per_number: float, expected_total: float,
++                   before_submit: Callable[[], None] | None = None) -> dict[str, Any]:
++        if (len(numbers) != 7 or any(type(x) is not int or x not in range(10) for x in numbers)
++                or len(set(numbers)) != 7):
+             raise RealBetError(f"TOP7 không hợp lệ: {numbers}")
+         if stake_per_number <= 0 or expected_total <= 0:
+             raise RealBetError("Stake không hợp lệ")
+@@ -325,11 +338,17 @@ class RealBetExecutor:
+ 
+         # Xóa giỏ cũ nếu đang còn lựa chọn từ lần trước.
+         clear_sel = str(selection.get("clear_selector") or "").strip()
+-        if clear_sel:
+-            clear_loc = page.locator(clear_sel)
+-            if clear_loc.count() == 1 and clear_loc.first.is_visible():
+-                clear_loc.first.click()
+-                page.wait_for_timeout(200)
++        selected_sel = str(selection.get("selected_selector") or "").strip()
++        if not selected_sel:
++            raise RealBetError("Thiếu selected_selector để xác nhận giỏ chỉ chứa TOP7")
++        if page.locator(selected_sel).count():
++            clear_loc = page.locator(clear_sel) if clear_sel else None
++            if clear_loc is None or clear_loc.count() != 1 or not clear_loc.first.is_visible():
++                raise RealBetError("Giỏ đang có lựa chọn và không thể xóa an toàn")
++            clear_loc.first.click()
++            page.wait_for_timeout(200)
++            if page.locator(selected_sel).count():
++                raise RealBetError("Giỏ vẫn còn lựa chọn sau khi xóa")
+ 
+         template = str(selection.get("number_button_selector_template") or "").strip()
+         for n in numbers:
+@@ -338,12 +357,9 @@ class RealBetExecutor:
+             el.click()
+             page.wait_for_timeout(int(timing.get("between_number_click_ms", 120)))
+ 
+-        selected_sel = str(selection.get("selected_selector") or "").strip()
+-        if selected_sel:
+-            count = page.locator(selected_sel).count()
+-            expected_count = int(selection.get("expected_selected_count", 7))
+-            if count != expected_count:
+-                raise RealBetError(f"Selected-count mismatch: web={count}, expected={expected_count}")
++        count = page.locator(selected_sel).count()
++        if count != 7:
++            raise RealBetError(f"Selected-count mismatch: web={count}, expected=7")
+ 
+         shared = self._one(page, str(stake_cfg.get("shared_input_selector") or ""), "shared stake input")
+         shared.click()
+@@ -392,6 +408,8 @@ class RealBetExecutor:
+         latest_cfg = load_config(self.config_path)
+         if not bool(latest_cfg.get("enabled", False)) or bool(latest_cfg.get("dry_run", True)):
+             raise RealBetError("Config đổi sang disabled/dry_run trước submit → hủy lệnh")
++        if before_submit is not None:
++            before_submit()
+ 
+         submit_sel = str((cfg.get("submit") or {}).get("selector") or "").strip()
+         submit = self._one(page, submit_sel, "submit")
+@@ -400,7 +418,12 @@ class RealBetExecutor:
+             page.bring_to_front()
+         except Exception:
+             pass
+-        submit.click()
++        try:
++            submit.click()
++        except Exception as exc:
++            # Playwright can time out after dispatching the click. Treat it as an
++            # uncertain submission so a later START cannot silently retry it.
++            raise RealBetError("Không rõ click submit đã gửi lệnh hay chưa", may_have_submitted=True) from exc
+         result["submitted"] = True
+         page.wait_for_timeout(int(timing.get("after_submit_ms", 500)))
+ 
+diff --git a/test_realbet.py b/test_realbet.py
+new file mode 100644
+index 0000000..ce85e00
+--- /dev/null
++++ b/test_realbet.py
+@@ -0,0 +1,251 @@
++"""Offline real-bet regression tests. Never connects to 88i or sends money."""
++import json
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++
++from wingo_realbet import RealBetError, RealBetExecutor
++import wingo_id77_adaptive_v7_6 as app
++
++
++class FakeExecutor:
++    def __init__(self, *, on_prepare=None, dry_run=False):
++        self.calls = []
++        self.on_prepare = on_prepare
++        self.dry_run = dry_run
++
++    def configured(self):
++        return True, "OK"
++
++    def read_balance(self):
++        return 200000.0
++
++    def place_top7(self, issue, numbers, stake, total, before_submit=None):
++        self.calls.append((issue, numbers, stake, total))
++        if self.on_prepare:
++            self.on_prepare()
++        before_submit()
++        return {"ok": True, "confirmed": True, "dry_run": self.dry_run,
++                "balance_after": 200000 - total, "ticket_text": "SIMULATED"}
++
++
++def args():
++    return SimpleNamespace(
++        real_bet_enabled=True, real_calibrated_min=.72, real_consensus_min=.60,
++        real_stability_min=.80, real_max_drift=.40, real_live_required_samples=80,
++        real_live_min_hit=.73, real_regime_required_samples=50,
++        real_regime_min_hit=.73, real_stop_consecutive_losses=5,
++        real_stop_profit_pct=1.0, real_stop_balance_floor_pct=.50,
++        real_stop_max_minutes=90, real_base_stake=3000,
++    )
++
++
++def gate(**changes):
++    base = {"passed": True, "data_health": "OK", "calibrated_prob": .75,
++            "consensus_score": .65, "stability_score": .85, "drift_score": .2,
++            "live_samples": 80, "live_hit_rate": .75, "regime_samples": 50,
++            "regime_hit_rate": .75, "selected": [0, 1, 2, 3, 4, 5, 6]}
++    return dict(base, **changes)
++
++
++class RealWorkflowTests(unittest.TestCase):
++    def setUp(self):
++        self.conn = app.init_db(":memory:", 525000, 3000)
++        self.conn.execute("UPDATE runtime_control SET tool_running=1,real_bet_armed=1,status='START_REQUESTED' WHERE id=1")
++        self.conn.commit()
++        self.a = args()
++
++    def tearDown(self):
++        self.conn.close()
++
++    def test_only_seven_number_bet_placed_once_and_settled(self):
++        executor = FakeExecutor()
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "123", gate(), self.a, executor), "PLACED")
++        self.assertEqual(executor.calls, [("123", [0, 1, 2, 3, 4, 5, 6], 3000.0, 21000.0)])
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "123", gate(), self.a, executor), "EXISTS")
++        self.assertEqual(len(executor.calls), 1)
++        row = self.conn.execute("SELECT selected_numbers_json,total_stake,status FROM real_bets").fetchone()
++        self.assertEqual(json.loads(row[0]), list(range(7)))
++        self.assertEqual(row[1:], (21000, "OPEN"))
++        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM paper_bets").fetchone()[0], 0)
++        app.settle_real_bet(self.conn, "123", 3, self.a)
++        self.assertEqual(self.conn.execute("SELECT status FROM real_bets").fetchone()[0], "WIN")
++        self.assertEqual(app.runtime_control(self.conn)["current_step"], 1)
++
++    def test_failed_gate_never_calls_executor(self):
++        executor = FakeExecutor()
++        status = app.maybe_place_real_bet(self.conn, "123", gate(consensus_score=.5), self.a, executor)
++        self.assertEqual(status, "REAL_GATE_SKIP:CONSENSUS")
++        self.assertEqual(executor.calls, [])
++        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM real_bets").fetchone()[0], 0)
++
++    def test_live_hit_gate_blocks_after_required_samples(self):
++        executor = FakeExecutor()
++        status = app.maybe_place_real_bet(self.conn, "123", gate(live_hit_rate=.70), self.a, executor)
++        self.assertEqual(status, "REAL_GATE_SKIP:LIVE_HIT")
++        self.assertEqual(executor.calls, [])
++
++    def test_stop_loss_blocks_even_if_gate_passes(self):
++        self.conn.execute("UPDATE runtime_control SET current_loss_streak=5 WHERE id=1")
++        self.conn.commit()
++        executor = FakeExecutor()
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "123", gate(), self.a, executor), "LOSS_STREAK_5")
++        self.assertEqual(executor.calls, [])
++        self.assertEqual(app.runtime_control(self.conn)["real_bet_armed"], 0)
++
++    def test_end_during_preparation_prevents_submit(self):
++        def end():
++            self.conn.execute("UPDATE runtime_control SET tool_running=0,real_bet_armed=0 WHERE id=1")
++            self.conn.commit()
++        executor = FakeExecutor(on_prepare=end)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "123", gate(), self.a, executor), "ERROR")
++        self.assertEqual(self.conn.execute("SELECT status FROM real_bets").fetchone()[0], "ERROR")
++
++    def test_issue_guard_prevents_submit(self):
++        executor = FakeExecutor()
++        def stale():
++            raise RealBetError("wrong issue")
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "123", gate(), self.a, executor,
++                                                  submit_guard=stale), "ERROR")
++
++    def test_dry_run_does_not_create_open_bet(self):
++        executor = FakeExecutor(dry_run=True)
++        self.assertEqual(app.maybe_place_real_bet(self.conn, "123", gate(), self.a, executor), "DRY_RUN")
++        self.assertEqual(self.conn.execute("SELECT status FROM real_bets").fetchone()[0], "DRY_RUN")
++        self.assertEqual(app.runtime_control(self.conn)["real_bet_armed"], 0)
++
++
++class Locator:
++    def __init__(self, page, selector):
++        self.page, self.selector = page, selector
++        self.first = self
++
++    def count(self):
++        if self.selector == "selected":
++            return self.page.selected
++        if self.selector == "rows":
++            return 7
++        return 1
++
++    def is_visible(self):
++        return True
++
++    def click(self):
++        if self.selector == "clear":
++            if not self.page.clear_broken:
++                self.page.selected = 0
++        elif self.selector.startswith("num_"):
++            self.page.selected += 1
++        elif self.selector == "submit":
++            self.page.submit_count += 1
++            if self.page.click_timeout:
++                raise TimeoutError("click timed out after dispatch")
++            self.page.balance -= 70
++
++    def fill(self, value):
++        self.page.filled = value
++
++    def press(self, key):
++        pass
++
++    def scroll_into_view_if_needed(self, **kwargs):
++        pass
++
++
++class Page:
++    def __init__(self):
++        self.selected = 0
++        self.submit_count = 0
++        self.balance = 1000
++        self.clear_broken = False
++        self.click_timeout = False
++
++    def locator(self, selector):
++        return Locator(self, selector)
++
++    def wait_for_timeout(self, ms):
++        pass
++
++    def bring_to_front(self):
++        pass
++
++
++class OfflineExecutor(RealBetExecutor):
++    def __init__(self, config, page):
++        super().__init__(config, "unused-profile")
++        self.cfg = json.loads(Path(config).read_text())
++        self.fake_page = page
++
++    def _goto(self, force=False):
++        return self.fake_page
++
++    def read_balance(self):
++        return self.fake_page.balance
++
++    def ensure_number_panel(self):
++        return list(range(10))
++
++    def _verify_row_stakes(self, page, expected):
++        return [expected] * 7
++
++    def _read_total(self, page):
++        return 70
++
++
++class BrowserFlowTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.path = Path(self.temp.name) / "config.json"
++        self.path.write_text(json.dumps({
++            "enabled": True, "dry_run": False,
++            "selection": {"selected_selector": "selected", "clear_selector": "clear",
++                          "number_button_selector_template": "num_{n}"},
++            "stake": {"shared_input_selector": "shared"},
++            "submit": {"selector": "submit"}, "total": {"selector": "total"},
++            "success": {"mode": "balance_decrease", "timeout_ms": 100}
++        }))
++        self.page = Page()
++        self.executor = OfflineExecutor(self.path, self.page)
++
++    def test_exact_seven_numbers_and_pre_submit_guard(self):
++        guard_calls = []
++        result = self.executor.place_top7("123", list(range(7)), 10, 70,
++                                          before_submit=lambda: guard_calls.append(1))
++        self.assertTrue(result["confirmed"])
++        self.assertEqual((self.page.selected, self.page.submit_count, guard_calls), (7, 1, [1]))
++
++    def test_old_cart_must_clear(self):
++        self.page.selected = 1
++        self.page.clear_broken = True
++        with self.assertRaisesRegex(RealBetError, "vẫn còn lựa chọn"):
++            self.executor.place_top7("123", list(range(7)), 10, 70)
++        self.assertEqual(self.page.submit_count, 0)
++
++    def test_out_of_range_number_rejected(self):
++        with self.assertRaisesRegex(RealBetError, "TOP7 không hợp lệ"):
++            self.executor.place_top7("123", [0, 1, 2, 3, 4, 5, 10], 10, 70)
++        self.assertEqual(self.page.submit_count, 0)
++
++    def test_click_timeout_is_uncertain_submission(self):
++        self.page.click_timeout = True
++        with self.assertRaises(RealBetError) as result:
++            self.executor.place_top7("123", list(range(7)), 10, 70)
++        self.assertTrue(result.exception.may_have_submitted)
++        self.assertEqual(self.page.submit_count, 1)
++
++    def test_repo_config_is_ready_and_wrong_game_rejected(self):
++        repo_config = Path(__file__).with_name("88i_realbet_config.json")
++        ready, reason = RealBetExecutor(repo_config, "unused-profile").configured()
++        self.assertTrue(ready, reason)
++        cfg = json.loads(repo_config.read_text())
++        cfg["target_url"] = cfg["target_url"].replace("id=77", "id=78")
++        self.path.write_text(json.dumps(cfg))
++        ready, reason = RealBetExecutor(self.path, "unused-profile").configured()
++        self.assertFalse(ready)
++        self.assertIn("id=77", reason)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -34,21 +34,7 @@ def atomic_csv(path, header, rows):
     try:
         with open(tmp,"w",newline="",encoding="utf-8-sig") as f:
             w=csv.writer(f); w.writerow(header); w.writerows(rows)
-
-        # Windows/OneDrive ??i khi kh?a CSV trong th?i gian r?t ng?n.
-        # Export CSV ch? ph?c v? dashboard, kh?ng ???c ph?p l?m ch?t writer.
-        last_exc = None
-        for _ in range(10):
-            try:
-                os.replace(tmp,path)
-                return
-            except PermissionError as exc:
-                last_exc = exc
-                time.sleep(0.25)
-
-        print(f"[CSV WARN] Kh?ng th? c?p nh?t {path}: {last_exc}")
-        print("[CSV WARN] B? qua export v?ng n?y; d? li?u trong SQLite v?n an to?n.")
-
+        os.replace(tmp,path)
     finally:
         if os.path.exists(tmp):
             try: os.remove(tmp)
@@ -954,7 +940,7 @@ def settle_real_bet(conn,issue,n,args):
         stop_real_tool(conn,reason)
 
 
-def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
+def maybe_place_real_bet(conn,issue,gate,args,executor):
     ctl=runtime_control(conn)
     if not ctl or not int(ctl.get("tool_running") or 0) or not int(ctl.get("real_bet_armed") or 0):
         return "STOPPED"
@@ -993,16 +979,7 @@ def maybe_place_real_bet(conn,issue,gate,args,executor,submit_guard=None):
         (str(issue),step,unit,json.dumps(gate["selected"]),stake_per,total,TOP7_ODDS,gate.get("calibrated_prob"),"PREPARED",balance,created))
     conn.commit()
     try:
-        def before_submit():
-            current=runtime_control(conn)
-            if (not current or not int(current.get("tool_running") or 0)
-                    or not int(current.get("real_bet_armed") or 0)):
-                raise RealBetError("Tool đã END/STOP trong lúc chuẩn bị giỏ")
-            if real_auto_stop_reason(current,args,balance=current.get("current_balance")):
-                raise RealBetError("Điều kiện dừng đã kích hoạt trước submit")
-            if submit_guard is not None:
-                submit_guard()
-        result=executor.place_top7(str(issue),gate["selected"],stake_per,total,before_submit=before_submit)
+        result=executor.place_top7(str(issue),gate["selected"],stake_per,total)
         if bool(result.get("dry_run")):
             conn.execute("""UPDATE real_bets SET status='DRY_RUN',balance_after_submit=?,ticket_text=?,error_text=? WHERE issue=?""",
                          (result.get("balance_after"),result.get("ticket_text"),"DRY_RUN: submit không được click",str(issue)))
@@ -1451,7 +1428,7 @@ def main():
     ap.add_argument("--db",default="wingo_88i_id77.db"); ap.add_argument("--csv",default="wingo_88i_id77.csv")
     ap.add_argument("--bets-csv",default="wingo_paper_bets.csv"); ap.add_argument("--predictions-csv",default="wingo_predictions.csv"); ap.add_argument("--performance-csv",default="wingo_model_performance.csv")
     ap.add_argument("--trigger-second",type=int,default=20); ap.add_argument("--poll",type=float,default=.12)
-    ap.add_argument("--paper-market",choices=["off","size","color","number","best"],default="off")
+    ap.add_argument("--paper-market",choices=["off","size","color","number","best"],default="size")
     ap.add_argument("--signal-threshold",type=float,default=.55); ap.add_argument("--min-edge",type=float,default=.05)
     ap.add_argument("--stake",type=float,default=50000); ap.add_argument("--bankroll",type=float,default=1000000)
     ap.add_argument("--performance-lookback",type=int,default=300); ap.add_argument("--min-live-predictions",type=int,default=30)
@@ -1583,13 +1560,7 @@ def main():
                             pbet,_=wait_to_target(s,li,bet_sec,args.poll)
                             bi=timing(pbet) if pbet else li
                         if bi["issue"]==info["issue"] and bi["second"]<=bet_sec and bi["second"]>int(bi.get("close",3)):
-                            def current_issue_guard():
-                                current=timing(fetch(s))
-                                if (current["issue"]!=info["issue"]
-                                        or current["second"]<=int(current["close"])+1):
-                                    raise RealBetError("Kỳ cược đã đổi hoặc quá sát giờ khóa cược")
-                            status=maybe_place_real_bet(conn,info["issue"],gate,args,real_executor,
-                                                        submit_guard=current_issue_guard)
+                            status=maybe_place_real_bet(conn,info["issue"],gate,args,real_executor)
                             print(f"[REAL @ second={bi['second']:02d}] {status}")
                             export_real_bets(conn,args)
                         else:
