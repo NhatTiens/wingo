@@ -1,0 +1,55 @@
+{
+  "enabled": true,
+  "dry_run": false,
+  "headless": false,
+  "target_url": "https://www.88idd.com/home/#/lottery?tabName=Lottery&id=77",
+  "default_timeout_ms": 8000,
+  "balance": {
+    "selector": "span.total_money"
+  },
+  "selection": {
+    "clear_selector": "div.myOrder div.cancel-btn",
+    "number_button_selector_template": "li.number.bg-number_{n}",
+    "selected_selector": "div.myOrder div.order-item-wp",
+    "expected_selected_count": 7
+  },
+  "stake": {
+    "shared_input_selector": "div.single-bet-wp input[type=\"text\"]",
+    "row_input_selector": "div.myOrder input[type=\"tel\"]",
+    "expected_row_inputs": 7,
+    "row_tolerance": 1
+  },
+  "total": {
+    "selector": "button.el-button.bet-btn.el-button--primary",
+    "tolerance": 1
+  },
+  "submit": {
+    "selector": "button.el-button.bet-btn.el-button--primary"
+  },
+  "confirm": {
+    "selector": "",
+    "required": false
+  },
+  "success": {
+    "mode": "balance_decrease",
+    "timeout_ms": 6000,
+    "balance_tolerance": 2
+  },
+  "ui_recovery": {
+    "number_panel_reload_attempts": 3,
+    "number_panel_wait_ms": 7000
+  },
+  "timing": {
+    "page_ready_ms": 2200,
+    "between_number_click_ms": 120,
+    "after_fill_ms": 800,
+    "after_submit_ms": 500,
+    "after_confirm_ms": 700
+  },
+  "dry_run_screenshot": "realbet_dryrun_{issue}.png",
+  "login": {
+    "mode": "manual_each_run",
+    "timeout_seconds": 600,
+    "poll_ms": 500
+  }
+}

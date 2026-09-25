@@ -1,0 +1,15 @@
+[Unit]
+Description=Wingo Dashboard v7.6
+After=network-online.target wingo-writer.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wingo/wingo_adaptive_v7_6_realbet_configurable
+ExecStart=/opt/wingo/wingo_adaptive_v7_6_realbet_configurable/venv/bin/python -m streamlit run /opt/wingo/wingo_adaptive_v7_6_realbet_configurable/wingo_dashboard_v7_6.py --server.address 127.0.0.1 --server.port 8501 --server.headless true
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

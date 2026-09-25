@@ -1,0 +1,2 @@
+﻿initial_bankroll,bankroll,base_stake_per_number,multiplier,max_level,stop_profit,stop_loss,session_profit,current_level,active,stop_reason,current_loss_streak,longest_loss_streak,longest_loss_streak_end_issue,settled_bets,rolling_window_max,unlimited_progression
+525000.0,525000.0,3000.0,4.0,3,52500.0,441000.0,0.0,1,1,,0,0,,0,80,1

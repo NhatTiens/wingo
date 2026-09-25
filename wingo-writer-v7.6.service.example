@@ -1,0 +1,16 @@
+[Unit]
+Description=Wingo Adaptive v7.6 Writer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/wingo/wingo_adaptive_v7_6_realbet_configurable
+ExecStart=/opt/wingo/wingo_adaptive_v7_6_realbet_configurable/venv/bin/python -u /opt/wingo/wingo_adaptive_v7_6_realbet_configurable/wingo_id77_adaptive_v7_6.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
