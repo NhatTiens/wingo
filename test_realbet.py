@@ -172,12 +172,17 @@ class RealWorkflowTests(unittest.TestCase):
               patch.object(app, "top7_calibration", return_value=(.72, None, 0, 0)),
               patch.object(app, "top7_consensus", return_value=(.55, 2, {}, 1)),
               patch.object(app, "top7_stability", return_value=(.75, {})),
-              patch.object(app, "top7_live_stats", side_effect=[
-                  {"n": 80, "hit_rate": .72}, {"n": 50, "hit_rate": .72}])):
+              patch.object(app, "top7_adaptive_hit_stats", side_effect=[
+                  {"n": 80, "hit_rate": .72}, {"n": 50, "hit_rate": .72},
+                  {"n": 80, "hit_rate": .72}, {"n": 49, "hit_rate": .70}])):
             actual_gate = app.top7_gate(self.conn, np.ones(10) / 10, {}, np.array([0]),
+                                        "BALANCED", "OK", .45, top_args)
+            warmup_gate = app.top7_gate(self.conn, np.ones(10) / 10, {}, np.array([0]),
                                         "BALANCED", "OK", .45, top_args)
         self.assertTrue(actual_gate["passed"])
         self.assertEqual(app.real_gate_check(actual_gate), (True, []))
+        self.assertEqual(actual_gate["statuses"]["regime_hit_ok"],"PASS")
+        self.assertEqual(warmup_gate["statuses"]["regime_hit_ok"],"WARMUP")
         actual_gate["passed"] = False
         actual_gate["failed"] = ["live_hit_ok"]
         self.assertEqual(app.real_gate_check(actual_gate), (False, ["live_hit_ok"]))
@@ -231,6 +236,81 @@ class RealWorkflowTests(unittest.TestCase):
         self.assertEqual(app.maybe_place_real_bet(self.conn, "123", gate(), self.a, executor), "DRY_RUN")
         self.assertEqual(self.conn.execute("SELECT status FROM real_bets").fetchone()[0], "DRY_RUN")
         self.assertEqual(app.runtime_control(self.conn)["real_bet_armed"], 0)
+
+
+class Top7AdaptiveHitTests(unittest.TestCase):
+    def setUp(self):
+        self.conn=app.init_db(":memory:",525000,3000)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def prediction(self,issue,hit,regime="BALANCED"):
+        self.conn.execute("""INSERT INTO top7_predictions(issue,created_at,selected_numbers_json,
+            hit_probability,break_even_probability,estimated_roi,regime_label,hit)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (str(issue),"now",json.dumps(list(range(7))),.75,.71,.05,regime,hit))
+        self.conn.commit()
+
+    def test_regime_and_live_retain_80_while_replacing_opposite_result(self):
+        for issue in range(1,81):
+            self.prediction(issue,1 if issue<=53 else 0)
+        live=app.top7_adaptive_hit_stats(self.conn,80)
+        regime=app.top7_adaptive_hit_stats(self.conn,80,"BALANCED")
+        self.assertEqual((live["n"],live["hit_rate"]),(80,53/80))
+        self.assertEqual(regime,live)
+
+        self.prediction(81,None)
+        app.settle_top7(self.conn,"81",3)
+        self.assertEqual(app.top7_adaptive_hit_stats(self.conn,80)["hit_rate"],54/80)
+        self.assertEqual(app.top7_adaptive_hit_stats(self.conn,80,"BALANCED")["hit_rate"],54/80)
+
+        self.prediction(82,None)
+        app.settle_top7(self.conn,"82",9)
+        self.assertEqual(app.top7_adaptive_hit_stats(self.conn,80)["hit_rate"],53/80)
+        self.prediction(83,None)
+        app.settle_top7(self.conn,"83",9)
+        self.assertEqual(app.top7_adaptive_hit_stats(self.conn,80,"BALANCED")["hit_rate"],52/80)
+        app.settle_top7(self.conn,"83",9)
+        self.assertEqual(app.top7_adaptive_hit_stats(self.conn,80)["hit_rate"],52/80)
+
+        self.prediction(84,None,"NEW_REGIME")
+        app.settle_top7(self.conn,"84",3)
+        self.assertEqual(app.top7_adaptive_hit_stats(self.conn,80)["hit_rate"],53/80)
+        self.assertEqual(app.top7_adaptive_hit_stats(self.conn,80,"BALANCED")["hit_rate"],52/80)
+        self.assertEqual(app.top7_adaptive_hit_stats(self.conn,80,"NEW_REGIME"),
+                         {"n":1,"hit_rate":1.0})
+
+    def test_regime_reaches_fifty_before_full_window(self):
+        for issue in range(1,51):
+            self.prediction(issue,1 if issue<=36 else 0,"NEW_REGIME")
+        stats=app.top7_adaptive_hit_stats(self.conn,80,"NEW_REGIME")
+        self.assertEqual((stats["n"],stats["hit_rate"]),(50,36/50))
+        self.prediction(51,None,"NEW_REGIME")
+        app.settle_top7(self.conn,"51",3)
+        stats=app.top7_adaptive_hit_stats(self.conn,80,"NEW_REGIME")
+        self.assertEqual((stats["n"],stats["hit_rate"]),(50,37/50))
+
+    def test_empty_history_and_saved_counter_survive_reopening_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db=Path(tmp)/"adaptive.db"
+            conn=app.init_db(db,525000,3000)
+            try:
+                conn.execute("""INSERT INTO top7_predictions(issue,created_at,selected_numbers_json,
+                    hit_probability,break_even_probability,estimated_roi,regime_label)
+                    VALUES(?,?,?,?,?,?,?)""",("1","now",json.dumps(list(range(7))),.75,.71,.05,"R"))
+                conn.commit()
+                app.settle_top7(conn,"1",3)
+                self.assertEqual(app.top7_adaptive_hit_stats(conn,80),{"n":1,"hit_rate":1.0})
+                conn.commit()
+            finally:
+                conn.close()
+            conn=app.init_db(db,525000,3000)
+            try:
+                self.assertEqual(app.top7_adaptive_hit_stats(conn,80),{"n":1,"hit_rate":1.0})
+                self.assertEqual(app.top7_adaptive_hit_stats(conn,80,"R"),{"n":1,"hit_rate":1.0})
+            finally:
+                conn.close()
 
 
 class ReconciliationTests(unittest.TestCase):

@@ -185,6 +185,16 @@ def init_db(path, bankroll, stake):
     ]:
         ensure_column(c, "top7_predictions", col, typ)
 
+    c.execute("""CREATE TABLE IF NOT EXISTS top7_adaptive_hit_state(
+        scope TEXT NOT NULL,
+        capacity INTEGER NOT NULL,
+        samples INTEGER NOT NULL,
+        wins INTEGER NOT NULL,
+        last_issue TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(scope,capacity)
+    )""")
+
     c.execute("""CREATE TABLE IF NOT EXISTS top7_bets(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         issue TEXT UNIQUE NOT NULL,
@@ -373,7 +383,7 @@ def history(payload):
 
 def settle(conn, issue, n, args=None):
     conn.execute("UPDATE adaptive_predictions SET actual_number=?,resolved_at=? WHERE issue=? AND actual_number IS NULL",(n,now(),issue))
-    settle_top7(conn,issue,n)
+    settle_top7(conn,issue,n,args)
     settle_strategy_bets(conn,issue,n)
     if args is not None:
         settle_real_bet(conn,issue,n,args)
@@ -1026,6 +1036,58 @@ def top7_live_stats(conn,n=100,regime=None):
     return {"n":len(rows),"hit_rate":hits/len(rows)}
 
 
+def top7_adaptive_hit_stats(conn,n=80,regime=None):
+    """Gate score: seed from the latest real outcomes, then replace opposite hits."""
+    cap=max(1,min(80,int(n)))
+    scope="live" if regime is None else f"regime:{regime}"
+    state=conn.execute("""SELECT samples,wins FROM top7_adaptive_hit_state
+        WHERE scope=? AND capacity=?""",(scope,cap)).fetchone()
+    if state is None:
+        if regime is None:
+            rows=conn.execute("""SELECT issue,hit FROM top7_predictions WHERE hit IS NOT NULL
+                ORDER BY issue DESC LIMIT ?""",(cap,)).fetchall()
+        else:
+            rows=conn.execute("""SELECT issue,hit FROM top7_predictions
+                WHERE hit IS NOT NULL AND regime_label=? ORDER BY issue DESC LIMIT ?""",
+                (str(regime),cap)).fetchall()
+        if rows:
+            state=(len(rows),sum(int(row[1]) for row in rows))
+            conn.execute("""INSERT OR IGNORE INTO top7_adaptive_hit_state(
+                scope,capacity,samples,wins,last_issue,updated_at) VALUES(?,?,?,?,?,?)""",
+                (scope,cap,state[0],state[1],rows[0][0],now()))
+        else:
+            state=(0,0)
+    samples,wins=map(int,state)
+    return {"n":samples,"hit_rate":wins/samples if samples else None}
+
+
+def update_top7_adaptive_hits(conn,issue,hit,regime,args=None):
+    """A new settled TOP7 prediction changes each active live/regime counter once."""
+    scopes=["live"]
+    if regime is not None:
+        scopes.append(f"regime:{regime}")
+    # Seed the default 80-sample counters before the new result is written.
+    for scope in scopes:
+        top7_adaptive_hit_stats(conn,80,None if scope=="live" else regime)
+    placeholders=",".join("?" for _ in scopes)
+    rows=conn.execute(f"""SELECT scope,capacity,samples,wins FROM top7_adaptive_hit_state
+        WHERE scope IN ({placeholders})""",scopes).fetchall()
+    for scope,cap,samples,wins in rows:
+        samples=int(samples); wins=int(wins); cap=int(cap)
+        threshold=(getattr(args,"top7_live_activate_samples",80) if scope=="live"
+                   else getattr(args,"top7_regime_activate_samples",50))
+        threshold=max(1,min(cap,int(threshold)))
+        if samples<threshold:
+            samples+=1
+            wins+=int(hit)
+        elif hit and wins<samples:
+            wins+=1  # Replace a wrong prediction with this correct prediction.
+        elif not hit and wins>0:
+            wins-=1  # Replace a correct prediction with this wrong prediction.
+        conn.execute("""UPDATE top7_adaptive_hit_state SET samples=?,wins=?,last_issue=?,updated_at=?
+            WHERE scope=? AND capacity=?""",(samples,wins,str(issue),now(),scope,cap))
+
+
 def top7_calibration(conn,current_raw,lookback=500):
     rows=conn.execute("""SELECT hit_probability,hit FROM top7_predictions
         WHERE hit IS NOT NULL ORDER BY issue DESC LIMIT ?""",(int(lookback),)).fetchall()
@@ -1090,15 +1152,10 @@ def top7_gate(conn,p,model_outs,x,regime,health,drift,args):
     )
     stability,stability_detail=top7_stability(x,selected)
 
-    # v7.2:
-    # Live hit dùng rolling window tối đa 80 kỳ. Khi có kỳ mới,
-    # mẫu mới được thêm và mẫu cũ nhất tự rơi khỏi cửa sổ.
-    # Khi đủ 80 mẫu, live hit trở thành hard gate.
-    live_gate=top7_live_stats(conn,min(80,int(args.top7_live_lookback)))
-
-    # Regime hit cũng dùng rolling window tối đa 80 mẫu đúng regime.
-    # Hard gate vẫn kích hoạt từ 50 mẫu; n không bao giờ vượt 80.
-    reg=top7_live_stats(conn,min(80,int(args.top7_regime_lookback)),regime=regime)
+    # Seed from the last 80 actual outcomes on first use. After that, a new hit
+    # replaces a miss (or vice versa); neither score exceeds 80 samples.
+    live_gate=top7_adaptive_hit_stats(conn,min(80,int(args.top7_live_lookback)))
+    reg=top7_adaptive_hit_stats(conn,min(80,int(args.top7_regime_lookback)),regime=regime)
 
     live_rate=live_gate["hit_rate"]
     regime_rate=reg["hit_rate"]
@@ -1242,13 +1299,15 @@ def place_top7_bet(conn,issue,gate,args):
         (issue,level,json.dumps(gate["selected"]),stake,total,TOP7_ODDS,gate["calibrated_prob"],gate["estimated_roi"],float(st["bankroll"]),now()))
     conn.commit();return True,"PLACED"
 
-def settle_top7(conn,issue,n):
+def settle_top7(conn,issue,n,args=None):
     # Prediction live: chỉ chấm sau khi kết quả thực sự xuất hiện.
     row=conn.execute("SELECT selected_numbers_json FROM top7_predictions WHERE issue=? AND hit IS NULL",(issue,)).fetchone()
     if row:
         try:selected=json.loads(row[0])
         except:selected=[]
         hit=int(int(n) in [int(x) for x in selected])
+        regime_row=conn.execute("SELECT regime_label FROM top7_predictions WHERE issue=?",(issue,)).fetchone()
+        update_top7_adaptive_hits(conn,issue,hit,regime_row[0] if regime_row else None,args)
         conn.execute("UPDATE top7_predictions SET actual_number=?,hit=?,resolved_at=? WHERE issue=?",(int(n),hit,now(),issue))
 
     bet=conn.execute("""SELECT id,level,selected_numbers_json,stake_per_number,total_stake,odds
@@ -1388,6 +1447,8 @@ def cycle(conn,issue,args,health="OK",drift_seconds=0.0,real_executor=None):
     if gate['failed']: print("TOP7 gate fail:", ", ".join(gate['failed']))
     if t7s40["n"]: print(f"TOP7 live40={t7s40['hit_rate']*100:.2f}% (n={t7s40['n']})")
     if t7s80["n"]: print(f"TOP7 rolling80={t7s80['hit_rate']*100:.2f}% (n={t7s80['n']})")
+    print(f"TOP7 gate adaptive hit: live={gate['live_hit_rate']*100 if gate['live_hit_rate'] is not None else 0:.2f}% (n={gate['live_samples']}), "
+          f"regime={gate['regime_hit_rate']*100 if gate['regime_hit_rate'] is not None else 0:.2f}% (n={gate['regime_samples']})")
     print("3-strategy live paper:", ",".join(strategy_placed) if strategy_placed else ("SKIP" if not gate["passed"] else "EXISTS"))
     for stx in strat_states:
         try: pat=json.loads(stx["pattern_json"])
@@ -1437,7 +1498,7 @@ def main():
     ap.add_argument("--top7-gate-min-live",type=int,default=30)
     ap.add_argument("--top7-live-min-hit",type=float,default=.72)
     ap.add_argument("--top7-live-lookback",type=int,default=80,help="Rolling window TOP7 live, tối đa 80 mẫu")
-    ap.add_argument("--top7-live-activate-samples",type=int,default=80,help="Khi rolling window đủ 80 mẫu, live_hit trở thành hard gate")
+    ap.add_argument("--top7-live-activate-samples",type=int,default=80,help="Khi bộ đếm Live đạt 80 mẫu, live_hit trở thành hard gate")
     ap.add_argument("--top7-live-decline-tolerance",type=float,default=.03)
     ap.add_argument("--top7-regime-min-samples",type=int,default=15)
     ap.add_argument("--top7-regime-min-hit",type=float,default=.72)

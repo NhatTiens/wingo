@@ -1,2 +1,2 @@
 ﻿tool_running,real_bet_armed,status,started_at,ended_at,session_start_balance,current_balance,session_profit,session_bets,current_step,current_win_streak,current_loss_streak,longest_loss_streak,day_key,day_start_balance,stop_reason,last_error,stop_consecutive_losses,stop_profit_pct,stop_balance_floor_pct,stop_max_minutes,bet_second,updated_at
-1,1,START_REQUESTED,2026-09-25T23:43:40+07:00,,,,0.0,0,0,0,0,0,2026-09-25,161845.0,,,,,,,10,2026-09-25T23:43:40+07:00
+0,0,STOPPED_READY,2026-09-25T23:43:40+07:00,2026-09-26T00:54:03+07:00,,177745.0,0.0,0,0,0,0,0,2026-09-25,161845.0,AWAITING_MANUAL_START,,,,,,10,2026-09-26T00:54:19+07:00

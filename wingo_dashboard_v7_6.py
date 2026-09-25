@@ -229,12 +229,12 @@ def render():
 | Consensus | ≥ 55% | Hard gate |
 | Stability | ≥ 75% | Hard gate |
 | Drift | ≤ 0.45 | Hard gate |
-| Live hit | ≥ 72% | Rolling tối đa 80; hard gate khi n = 80 |
-| Regime hit | ≥ 72% | Rolling tối đa 80; hard gate khi n ≥ 50 |
+| Live hit | ≥ 72% | Bộ đếm tối đa 80; hard gate khi n = 80 |
+| Regime hit | ≥ 72% | Bộ đếm tối đa 80 theo regime; hard gate khi n ≥ 50 |
 
-Live/Regime luôn dùng tối đa 80 mẫu gần nhất: mẫu mới vào thì mẫu cũ nhất tự rơi khỏi cửa sổ. Raw P(hit), ECE và Gate Score vẫn chỉ để theo dõi.
+Lần đầu, mỗi bộ đếm lấy tối đa 80 kết quả thực tế gần nhất. Khi đạt ngưỡng riêng (Live n=80; Regime n=50), dự đoán đúng thay một mẫu sai nếu có; dự đoán sai thay một mẫu đúng nếu có. Nếu hết mẫu đối lập, tỷ lệ giữ nguyên. Lịch sử Rolling 80 bên dưới vẫn là thống kê 80 kỳ gần nhất. Raw P(hit), ECE và Gate Score chỉ để theo dõi.
 """)
-        st.caption("Rolling n = 0→80. Live hit hard gate khi đủ 80; Regime hit hard gate từ 50 và cả hai không bao giờ vượt n=80.")
+        st.caption("Live hit chặn cược và thay mẫu từ n=80; Regime hit chặn cược và thay mẫu từ n=50. Các regime đã có n=80 vẫn giữ n=80; không bộ đếm nào vượt 80.")
         if top7pred is None or top7pred.empty:
             st.info("Chưa có TOP7 prediction. Hãy chạy writer v7.4.")
         else:
@@ -258,8 +258,8 @@ Live/Regime luôn dùng tối đa 80 mẫu gần nhất: mẫu mới vào thì m
 
             g=st.columns(6)
             g[0].metric("Regime",str(lp.get("regime_label","-")))
-            g[1].metric("Regime hit",pct(lp.get("regime_hit_rate")),f"n={int(float(lp.get('regime_samples',0) or 0))}")
-            g[2].metric("Live hit",pct(lp.get("live_hit_rate")),f"n={int(float(lp.get('live_samples',0) or 0))}")
+            g[1].metric("Regime hit · Gate",pct(lp.get("regime_hit_rate")),f"n={int(float(lp.get('regime_samples',0) or 0))}")
+            g[2].metric("Live hit · Gate",pct(lp.get("live_hit_rate")),f"n={int(float(lp.get('live_samples',0) or 0))}")
             g[3].metric("TOP7 ECE",num(lp.get("calibration_ece_top7")))
             g[4].metric("Data health",str(lp.get("data_health","-")))
             g[5].metric("Drift",num(lp.get("drift_score")))
@@ -310,7 +310,7 @@ Live/Regime luôn dùng tối đa 80 mẫu gần nhất: mẫu mới vào thì m
                 for col,n,label in [(a[0],20,"Hit 20"),(a[1],40,"Hit 40"),(a[2],80,"Rolling 80")]:
                     q=resolved.tail(n); col.metric(label,f"{q['hit'].mean()*100:.2f}%",f"n={len(q)}")
                 q80=resolved.tail(80)
-                a[3].metric("Window đang dùng",f"{q80['hit'].mean()*100:.2f}%",f"n={len(q80)}/80")
+                a[3].metric("Live hit · Gate",pct(lp.get("live_hit_rate")),f"n={int(float(lp.get('live_samples',0) or 0))}")
 
         st.markdown("### 🧪 LIVE PAPER TEST · 3 chiến thuật")
         st.caption("Cả 3 nhận cùng một TOP7 khi Bet Gate PASS. Đây là mô phỏng theo kết quả thật; writer không gửi lệnh cược lên website.")
